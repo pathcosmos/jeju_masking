@@ -351,6 +351,20 @@ python mask_video_optimized.py video.mp4 --detect-interval 5 --detect-scale 0.25
   - 사람 감지 + 얼굴 감지 2단계 파이프라인 구성
   - `--mask-person` 옵션으로 사람 전체 마스킹 선택 가능하도록
 
+### 4. NVIDIA GPU 최적화 세팅
+
+- **현재 상태**: Apple Silicon MPS 가속만 구현됨
+- **필요 사항**:
+  - CUDA 환경에서의 성능 최적화 테스트 및 튜닝
+  - TensorRT 변환을 통한 추론 속도 향상
+  - GPU 메모리 사용량 최적화
+  - 멀티 GPU 지원 (대용량 영상 병렬 처리)
+- **개선 방향**:
+  - `--device cuda` 옵션 최적화 검증
+  - FP16/INT8 양자화 적용
+  - CUDA 스트림을 활용한 비동기 처리
+  - Docker 이미지 제공 (CUDA 환경 포함)
+
 ---
 
 ## 라이선스
