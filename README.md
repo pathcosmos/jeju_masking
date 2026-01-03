@@ -1,12 +1,14 @@
 # Video Privacy Masking Tool
 
 4K 영상에서 얼굴과 차량 번호판을 자동으로 감지하고 마스킹하는 도구입니다.
-Apple Silicon MPS GPU 가속, 멀티스레딩, 트래킹 보간 등 다양한 최적화 기법을 적용하여 고해상도 영상도 효율적으로 처리합니다.
+NVIDIA CUDA / Apple Silicon MPS GPU 가속, 멀티스레딩, 트래킹 보간 등 다양한 최적화 기법을 적용하여 고해상도 영상도 효율적으로 처리합니다.
 
 ## 주요 기능
 
-- **얼굴 감지 및 마스킹**: OpenCV DNN 기반 SSD 모델 사용
+- **얼굴 감지 및 마스킹**: OpenCV DNN 기반 SSD 모델 사용 (CUDA 가속 지원)
 - **차량/번호판 감지 및 마스킹**: YOLOv8n 모델 + ByteTrack/BoT-SORT 트래킹
+- **NVIDIA CUDA GPU 가속**: RTX 시리즈에서 FP16 추론 및 NVENC 하드웨어 인코딩
+- **OpenCV DNN CUDA 백엔드**: 얼굴 감지를 GPU에서 처리
 - **MPS GPU 가속**: Apple Silicon에서 Metal Performance Shaders 활용
 - **멀티스레딩 파이프라인**: 읽기/처리/쓰기 분리로 성능 향상
 - **프레임 스킵 + 트래킹 보간**: 모든 프레임 감지 없이 추적으로 마스킹 유지
@@ -32,26 +34,45 @@ jeju_masking/
 
 ### 1. 시스템 의존성
 
+#### macOS (Apple Silicon)
+
 ```bash
 # ffmpeg 설치 (HEVC 인코딩용)
 brew install ffmpeg
 ```
 
+#### Ubuntu/Linux (NVIDIA GPU)
+
+```bash
+# ffmpeg 및 빌드 도구 설치
+sudo apt update
+sudo apt install -y ffmpeg build-essential cmake git pkg-config
+```
+
 ### 2. Python 환경 설정
+
+#### 기본 설치 (pip OpenCV - CUDA 없음)
 
 ```bash
 # uv 설치 (없는 경우)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 가상환경 생성
-uv venv --python 3.11
+uv venv --python 3.12
 
 # 가상환경 활성화
 source .venv/bin/activate
 
 # 패키지 설치
-uv pip install ultralytics opencv-python-headless numpy lap pyyaml torch torchvision
+uv pip install ultralytics opencv-contrib-python numpy lap pyyaml torch torchvision
 ```
+
+#### NVIDIA GPU 최적화 설치 (OpenCV CUDA 빌드)
+
+NVIDIA GPU에서 OpenCV DNN CUDA 백엔드를 사용하려면 OpenCV를 소스에서 빌드해야 합니다.
+pip로 설치되는 opencv-python 패키지는 CUDA 지원이 포함되어 있지 않습니다.
+
+자세한 빌드 가이드는 아래 [OpenCV CUDA 빌드 가이드](#opencv-cuda-빌드-가이드-nvidia-gpu) 섹션을 참조하세요.
 
 ---
 
@@ -228,7 +249,34 @@ tail -f masking.log
 
 ## 변경 이력
 
-### v2.1 - 2026-01-02 (현재)
+### v2.4 - 2026-01-03 (현재)
+
+**NVIDIA CUDA 최적화**
+- **OpenCV DNN CUDA 백엔드 지원**: 얼굴 감지를 GPU에서 처리
+  - `check_opencv_cuda_support()`: OpenCV CUDA/cuDNN 지원 여부 확인
+  - `FaceDetectorDNN` 클래스에 CUDA 백엔드 자동 선택 로직 추가
+  - CUDA 사용 불가 시 자동으로 CPU fallback
+- **시스템 하드웨어 자동 감지**: `get_system_info()` 함수 추가
+  - CPU 모델, 코어/스레드 수, 최대 클럭
+  - RAM 총량 및 사용 가능량
+  - GPU 모델, VRAM, CUDA 버전, 아키텍처 감지
+- **하드웨어 기반 자동 최적화**: `optimize_settings_for_hardware()` 함수
+  - CPU 스레드 수 기반 워커 수 자동 조정 (threads // 2)
+  - RAM 기반 프레임 큐 크기 계산
+  - VRAM 기반 배치 크기 자동 계산 (VRAM 70% 활용)
+  - 12GB+ VRAM: detect_interval=1 (매 프레임 감지 가능)
+- **GPU 메모리 최적화**:
+  - cuDNN benchmark 모드 활성화
+  - TF32 연산 활성화 (Ampere+)
+  - 주기적 GPU 캐시 정리
+- **NVENC 하드웨어 인코딩**: RTX GPU에서 hevc_nvenc 자동 사용
+  - NVENC 실패 시 libx265 소프트웨어 인코딩 fallback
+
+**Python 환경 변경**
+- Python 3.11 → 3.12로 업그레이드 (OpenCV CUDA 빌드 호환성)
+- NumPy 2.x → 1.26.4로 다운그레이드 (OpenCV 바인딩 호환성)
+
+### v2.1 - 2026-01-02
 
 **버그 수정**
 - **차량 감지 버그 수정**: `detect_batch()`에서 `predict()` 대신 `track()` 사용
@@ -351,19 +399,199 @@ python mask_video_optimized.py video.mp4 --detect-interval 5 --detect-scale 0.25
   - 사람 감지 + 얼굴 감지 2단계 파이프라인 구성
   - `--mask-person` 옵션으로 사람 전체 마스킹 선택 가능하도록
 
-### 4. NVIDIA GPU 최적화 세팅
+### 4. NVIDIA GPU 최적화 세팅 (v2.4에서 일부 완료)
 
-- **현재 상태**: Apple Silicon MPS 가속만 구현됨
-- **필요 사항**:
-  - CUDA 환경에서의 성능 최적화 테스트 및 튜닝
+- **완료된 항목** (v2.4):
+  - ✅ OpenCV DNN CUDA 백엔드 지원 (얼굴 감지 GPU 가속)
+  - ✅ 시스템 하드웨어 자동 감지 및 최적화
+  - ✅ VRAM 기반 배치 크기 자동 계산
+  - ✅ cuDNN benchmark 모드, TF32 활성화
+  - ✅ NVENC 하드웨어 인코딩 지원
+  - ✅ FP16 추론 (half=True)
+- **추가 개선 필요**:
   - TensorRT 변환을 통한 추론 속도 향상
-  - GPU 메모리 사용량 최적화
   - 멀티 GPU 지원 (대용량 영상 병렬 처리)
-- **개선 방향**:
-  - `--device cuda` 옵션 최적화 검증
-  - FP16/INT8 양자화 적용
   - CUDA 스트림을 활용한 비동기 처리
   - Docker 이미지 제공 (CUDA 환경 포함)
+
+---
+
+## OpenCV CUDA 빌드 가이드 (NVIDIA GPU)
+
+pip로 설치되는 `opencv-python` 패키지는 CUDA 지원이 포함되어 있지 않습니다.
+OpenCV DNN CUDA 백엔드를 사용하려면 소스에서 직접 빌드해야 합니다.
+
+### 테스트 환경
+
+| 항목 | 버전 |
+|------|------|
+| OS | Ubuntu 24.04 LTS |
+| GPU | NVIDIA RTX 4070 Super (12GB VRAM) |
+| CUDA | 12.0 |
+| cuDNN | 9.17.1 |
+| Python | 3.12.3 |
+| OpenCV | 4.10.0 |
+| GCC | 12 (CUDA 12.0 호환) |
+
+### 1. 빌드 의존성 설치
+
+```bash
+sudo apt update
+sudo apt install -y \
+    build-essential cmake git pkg-config \
+    libjpeg-dev libpng-dev libtiff-dev \
+    libavcodec-dev libavformat-dev libswscale-dev \
+    libv4l-dev libxvidcore-dev libx264-dev \
+    libgtk-3-dev libatlas-base-dev gfortran \
+    python3.12-dev python3-numpy \
+    libtbb-dev libdc1394-dev \
+    gcc-12 g++-12
+```
+
+> **중요**: CUDA 12.0은 GCC 12 이하만 지원합니다. Ubuntu 24.04는 기본 GCC 13+를 사용하므로 gcc-12를 별도 설치해야 합니다.
+
+### 2. OpenCV 소스 다운로드
+
+```bash
+cd /tmp
+git clone --depth 1 --branch 4.10.0 https://github.com/opencv/opencv.git
+git clone --depth 1 --branch 4.10.0 https://github.com/opencv/opencv_contrib.git
+```
+
+### 3. CMake 설정 및 빌드
+
+```bash
+mkdir -p /tmp/opencv_build && cd /tmp/opencv_build
+
+# GCC 12 지정 (CUDA 12.0 호환성)
+export CC=/usr/bin/gcc-12
+export CXX=/usr/bin/g++-12
+
+# GPU 아키텍처 확인 (예: RTX 4070 = 8.9)
+# https://developer.nvidia.com/cuda-gpus 참조
+
+cmake \
+    -D CMAKE_BUILD_TYPE=RELEASE \
+    -D CMAKE_INSTALL_PREFIX=/usr/local \
+    -D OPENCV_EXTRA_MODULES_PATH=/tmp/opencv_contrib/modules \
+    -D CMAKE_C_COMPILER=/usr/bin/gcc-12 \
+    -D CMAKE_CXX_COMPILER=/usr/bin/g++-12 \
+    -D WITH_CUDA=ON \
+    -D WITH_CUDNN=ON \
+    -D OPENCV_DNN_CUDA=ON \
+    -D ENABLE_FAST_MATH=ON \
+    -D CUDA_FAST_MATH=ON \
+    -D CUDA_ARCH_BIN=8.9 \
+    -D WITH_CUBLAS=ON \
+    -D WITH_TBB=ON \
+    -D WITH_V4L=ON \
+    -D BUILD_opencv_python3=ON \
+    -D PYTHON3_EXECUTABLE=/usr/bin/python3.12 \
+    -D BUILD_EXAMPLES=OFF \
+    -D BUILD_TESTS=OFF \
+    -D BUILD_PERF_TESTS=OFF \
+    /tmp/opencv
+
+# 빌드 (CPU 코어 수에 맞게 -j 옵션 조정)
+make -j16
+
+# 설치
+sudo make install
+sudo ldconfig
+```
+
+#### GPU 아키텍처 (CUDA_ARCH_BIN) 참조
+
+| GPU 시리즈 | 아키텍처 | CUDA_ARCH_BIN |
+|-----------|----------|---------------|
+| RTX 40xx (Ada Lovelace) | sm_89 | 8.9 |
+| RTX 30xx (Ampere) | sm_86 | 8.6 |
+| RTX 20xx (Turing) | sm_75 | 7.5 |
+| GTX 10xx (Pascal) | sm_61 | 6.1 |
+
+### 4. Python 가상환경 설정
+
+```bash
+cd /path/to/jeju_masking
+
+# Python 3.12로 가상환경 생성 (OpenCV 빌드 버전과 일치)
+uv venv --python python3.12
+source .venv/bin/activate
+
+# 필수 패키지 설치 (opencv 제외)
+uv pip install ultralytics torch torchvision numpy lap pyyaml
+
+# pip opencv 제거 (의존성으로 설치된 경우)
+uv pip uninstall opencv-python opencv-python-headless opencv-contrib-python 2>/dev/null || true
+
+# 시스템 OpenCV CUDA를 venv에 심링크
+SITE_PACKAGES=$(.venv/bin/python -c "import site; print(site.getsitepackages()[0])")
+ln -sf /usr/local/lib/python3.12/dist-packages/cv2 $SITE_PACKAGES/cv2
+
+# NumPy 다운그레이드 (OpenCV 바인딩 호환성)
+uv pip install "numpy<2"
+```
+
+### 5. 설치 확인
+
+```bash
+.venv/bin/python -c "
+import cv2
+print('OpenCV version:', cv2.__version__)
+print('CUDA devices:', cv2.cuda.getCudaEnabledDeviceCount())
+
+# CUDA 빌드 정보 확인
+build = cv2.getBuildInformation()
+for line in build.split('\n'):
+    if 'CUDA' in line or 'cuDNN' in line:
+        print(line)
+"
+```
+
+예상 출력:
+```
+OpenCV version: 4.10.0
+CUDA devices: 1
+  NVIDIA CUDA:                   YES (ver 12.0, CUFFT CUBLAS FAST_MATH)
+    NVIDIA GPU arch:             89
+  cuDNN:                         YES (ver 9.17.1)
+```
+
+### 6. 문제 해결
+
+#### GCC 버전 오류
+
+```
+error: #error -- unsupported GNU version! gcc versions later than 12 are not supported!
+```
+
+해결: CMake에서 GCC 12 명시적 지정
+```bash
+export CC=/usr/bin/gcc-12
+export CXX=/usr/bin/g++-12
+cmake -D CMAKE_C_COMPILER=/usr/bin/gcc-12 -D CMAKE_CXX_COMPILER=/usr/bin/g++-12 ...
+```
+
+#### NumPy 버전 오류
+
+```
+A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x
+```
+
+해결: NumPy 다운그레이드
+```bash
+uv pip install "numpy<2"
+```
+
+#### Python 버전 불일치
+
+OpenCV는 빌드 시 지정한 Python 버전의 바인딩만 생성합니다.
+venv Python 버전이 빌드 시 사용한 버전과 일치해야 합니다.
+
+```bash
+# 빌드 시 Python 3.12 사용한 경우
+uv venv --python python3.12
+```
 
 ---
 

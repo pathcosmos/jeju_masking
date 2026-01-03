@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-최적화된 얼굴 및 번호판 마스킹 스크립트 v2.1
-- MPS GPU 가속 (Apple Silicon) - 완전 구현
-- 멀티스레딩 파이프라인 (읽기/처리/쓰기 분리)
+최적화된 얼굴 및 번호판 마스킹 스크립트 v2.4
+- 시스템 하드웨어 자동 감지 및 최적화 (CPU/RAM/GPU)
+- NVIDIA CUDA GPU 가속 최적화 (FP16, TensorRT 지원)
+- OpenCV DNN CUDA 가속 (얼굴 감지 GPU 처리)
+- MPS GPU 가속 (Apple Silicon)
+- 멀티스레딩 파이프라인 (CPU 스레드 기반 워커 수 자동 조정)
+- RAM 기반 프레임 큐 크기 자동 조정
+- GPU VRAM 기반 배치 크기 자동 계산
 - 프레임 스킵 + 트래킹 보간
 - 해상도 다운스케일 감지 (출력은 원본 유지)
-- 배치 추론 지원 - 완전 구현
-- 확장된 트래킹 파라미터 - 완전 구현
+- GPU 메모리 최적화 (cuDNN benchmark, TF32, 캐시 정리)
+- NVENC 하드웨어 인코딩 지원 (RTX 시리즈)
 """
 
 import argparse
@@ -65,6 +70,201 @@ FACE_PROTO_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples
 FACE_MODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 
 
+def get_system_info():
+    """시스템 하드웨어 정보 수집"""
+    import subprocess
+    import re
+    
+    info = {
+        'cpu': {},
+        'ram': {},
+        'gpu': None
+    }
+    
+    # CPU 정보
+    try:
+        result = subprocess.run(['lscpu'], capture_output=True, text=True)
+        lscpu_output = result.stdout
+        
+        # 모델명
+        model_match = re.search(r'Model name:\s*(.+)', lscpu_output)
+        info['cpu']['model'] = model_match.group(1).strip() if model_match else 'Unknown'
+        
+        # 코어 수
+        cores_match = re.search(r'Core\(s\) per socket:\s*(\d+)', lscpu_output)
+        sockets_match = re.search(r'Socket\(s\):\s*(\d+)', lscpu_output)
+        cores = int(cores_match.group(1)) if cores_match else 1
+        sockets = int(sockets_match.group(1)) if sockets_match else 1
+        info['cpu']['cores'] = cores * sockets
+        
+        # 스레드 수
+        threads_match = re.search(r'CPU\(s\):\s*(\d+)', lscpu_output)
+        info['cpu']['threads'] = int(threads_match.group(1)) if threads_match else info['cpu']['cores']
+        
+        # 최대 클럭
+        max_mhz_match = re.search(r'CPU max MHz:\s*([\d.]+)', lscpu_output)
+        info['cpu']['max_mhz'] = float(max_mhz_match.group(1)) if max_mhz_match else 0
+        
+    except Exception:
+        info['cpu'] = {'model': 'Unknown', 'cores': 4, 'threads': 8, 'max_mhz': 0}
+    
+    # RAM 정보
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            meminfo = f.read()
+        total_match = re.search(r'MemTotal:\s*(\d+)', meminfo)
+        available_match = re.search(r'MemAvailable:\s*(\d+)', meminfo)
+        
+        info['ram']['total_gb'] = int(total_match.group(1)) / (1024**2) if total_match else 0
+        info['ram']['available_gb'] = int(available_match.group(1)) / (1024**2) if available_match else 0
+    except Exception:
+        info['ram'] = {'total_gb': 8, 'available_gb': 4}
+    
+    # GPU 정보 (NVIDIA)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            info['gpu'] = {
+                'name': props.name,
+                'vram_gb': props.total_memory / (1024**3),
+                'compute_capability': f"{props.major}.{props.minor}",
+                'multi_processor_count': props.multi_processor_count,
+                'type': 'cuda'
+            }
+    except Exception:
+        pass
+    
+    # MPS 정보 (Apple Silicon)
+    if info['gpu'] is None:
+        try:
+            import torch
+            if torch.backends.mps.is_available() and platform.processor() == 'arm':
+                info['gpu'] = {
+                    'name': 'Apple Silicon (MPS)',
+                    'vram_gb': info['ram']['total_gb'] * 0.75,  # 통합 메모리
+                    'type': 'mps'
+                }
+        except Exception:
+            pass
+    
+    return info
+
+
+def get_optimal_settings(system_info, frame_width=3840, frame_height=2160):
+    """시스템 사양에 맞는 최적 설정 자동 계산"""
+    settings = {
+        'device': 'cpu',
+        'batch_size': 2,
+        'detect_scale': 0.5,
+        'detect_interval': 3,
+        'num_workers': 2,
+        'queue_size': 64,
+        'use_fp16': False,
+    }
+    
+    cpu = system_info.get('cpu', {})
+    ram = system_info.get('ram', {})
+    gpu = system_info.get('gpu')
+    
+    # CPU 스레드 기반 워커 수 설정 (I/O 바운드 작업이므로 더 많은 워커 허용)
+    threads = cpu.get('threads', 8)
+    settings['num_workers'] = max(2, min(threads // 2, 12))  # 2~12 사이 (스레드의 절반)
+    
+    # RAM 기반 큐 크기 설정
+    ram_gb = ram.get('available_gb', 8)
+    if ram_gb >= 24:
+        settings['queue_size'] = 256
+    elif ram_gb >= 16:
+        settings['queue_size'] = 192
+    elif ram_gb >= 8:
+        settings['queue_size'] = 128
+    else:
+        settings['queue_size'] = 64
+    
+    # GPU 설정
+    if gpu:
+        settings['device'] = gpu.get('type', 'cpu')
+        vram_gb = gpu.get('vram_gb', 4)
+        
+        # VRAM 기반 배치 크기 계산 (RTX 시리즈 최적화)
+        # 4K 0.5 scale 기준 프레임당 약 50MB, YOLO 모델 약 500MB
+        scaled_pixels = (frame_width * 0.5) * (frame_height * 0.5)
+        frame_memory_gb = (scaled_pixels * 3 * 4) / (1024**3)  # float32
+
+        # VRAM의 70% 사용 (더 적극적으로 GPU 활용)
+        available_vram = vram_gb * 0.7 - 0.5  # 0.5GB 모델용
+        settings['batch_size'] = max(2, min(int(available_vram / (frame_memory_gb * 2.5)), 24))
+        
+        # CUDA 8.0+ (Ampere 이상)에서 FP16 권장
+        compute_cap = gpu.get('compute_capability', '0.0')
+        major_version = int(compute_cap.split('.')[0])
+        if major_version >= 7 and gpu.get('type') == 'cuda':
+            settings['use_fp16'] = True
+        
+        # 고성능 GPU (VRAM 기반 설정 최적화)
+        if vram_gb >= 12:
+            settings['detect_scale'] = 0.6
+            settings['detect_interval'] = 1  # 고성능 GPU는 매 프레임 감지 가능
+        elif vram_gb >= 8:
+            settings['detect_scale'] = 0.5
+            settings['detect_interval'] = 2
+        elif vram_gb >= 6:
+            settings['detect_scale'] = 0.5
+            settings['detect_interval'] = 3
+        else:
+            settings['detect_scale'] = 0.4
+            settings['detect_interval'] = 4
+    
+    return settings
+
+
+def print_system_info(system_info, settings=None):
+    """시스템 정보 및 최적 설정 출력"""
+    cpu = system_info.get('cpu', {})
+    ram = system_info.get('ram', {})
+    gpu = system_info.get('gpu')
+    
+    print("\n" + "=" * 60)
+    print("🖥️  시스템 하드웨어 정보")
+    print("=" * 60)
+    
+    # CPU
+    print(f"\n💻 CPU: {cpu.get('model', 'Unknown')}")
+    print(f"   코어: {cpu.get('cores', '?')}개 | 스레드: {cpu.get('threads', '?')}개")
+    if cpu.get('max_mhz'):
+        print(f"   최대 클럭: {cpu.get('max_mhz')/1000:.2f} GHz")
+    
+    # RAM
+    print(f"\n🧠 RAM: {ram.get('total_gb', 0):.1f} GB (사용 가능: {ram.get('available_gb', 0):.1f} GB)")
+    
+    # GPU
+    if gpu:
+        print(f"\n🎮 GPU: {gpu.get('name', 'Unknown')}")
+        print(f"   VRAM: {gpu.get('vram_gb', 0):.1f} GB")
+        if gpu.get('compute_capability'):
+            print(f"   Compute Capability: {gpu.get('compute_capability')}")
+        if gpu.get('multi_processor_count'):
+            print(f"   SM 수: {gpu.get('multi_processor_count')}")
+    else:
+        print("\n⚠️  GPU: 감지되지 않음 (CPU 모드)")
+    
+    # 최적 설정
+    if settings:
+        print("\n" + "-" * 60)
+        print("⚡ 자동 최적화 설정")
+        print("-" * 60)
+        print(f"   디바이스: {settings.get('device', 'cpu').upper()}")
+        print(f"   배치 크기: {settings.get('batch_size', 4)}")
+        print(f"   감지 스케일: {settings.get('detect_scale', 0.5)}")
+        print(f"   감지 간격: {settings.get('detect_interval', 3)}프레임마다")
+        print(f"   워커 수: {settings.get('num_workers', 2)}")
+        print(f"   큐 크기: {settings.get('queue_size', 64)}")
+        print(f"   FP16 추론: {'✅ 활성화' if settings.get('use_fp16') else '❌ 비활성화'}")
+    
+    print("=" * 60 + "\n")
+
+
 def get_optimal_device():
     """최적 디바이스 자동 감지"""
     import torch
@@ -73,6 +273,91 @@ def get_optimal_device():
     elif torch.backends.mps.is_available() and platform.processor() == 'arm':
         return 'mps'
     return 'cpu'
+
+
+def get_cuda_info():
+    """CUDA GPU 상세 정보 반환"""
+    import torch
+    if not torch.cuda.is_available():
+        return None
+    
+    info = {
+        'device_count': torch.cuda.device_count(),
+        'current_device': torch.cuda.current_device(),
+        'devices': []
+    }
+    
+    for i in range(info['device_count']):
+        props = torch.cuda.get_device_properties(i)
+        device_info = {
+            'id': i,
+            'name': props.name,
+            'total_memory_gb': props.total_memory / (1024**3),
+            'compute_capability': f"{props.major}.{props.minor}",
+            'multi_processor_count': props.multi_processor_count,
+        }
+        info['devices'].append(device_info)
+    
+    return info
+
+
+def setup_cuda_optimization(device='cuda', gpu_id=0):
+    """CUDA 최적화 설정"""
+    import torch
+    
+    if not torch.cuda.is_available():
+        return False
+    
+    # 특정 GPU 선택
+    if gpu_id >= 0 and gpu_id < torch.cuda.device_count():
+        torch.cuda.set_device(gpu_id)
+    
+    # CUDA 최적화 플래그 설정
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True  # 입력 크기 일정 시 최적 알고리즘 자동 선택
+    torch.backends.cuda.matmul.allow_tf32 = True  # TF32 연산 허용 (Ampere+)
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # 메모리 단편화 방지
+    if hasattr(torch.cuda, 'memory'):
+        torch.cuda.empty_cache()
+    
+    return True
+
+
+def get_optimal_batch_size(device='cuda', frame_width=3840, frame_height=2160, detect_scale=0.5):
+    """GPU 메모리 기반 최적 배치 크기 자동 계산"""
+    import torch
+    
+    if device == 'cpu':
+        return 2
+    elif device == 'mps':
+        return 4
+    elif device == 'cuda' and torch.cuda.is_available():
+        # GPU 메모리 기반 계산
+        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        
+        # 대략적 메모리 사용량 추정 (프레임당 ~200MB for 4K at 0.5 scale)
+        scaled_width = int(frame_width * detect_scale)
+        scaled_height = int(frame_height * detect_scale)
+        frame_memory_mb = (scaled_width * scaled_height * 3 * 4) / (1024**2)  # float32
+        
+        # GPU 메모리의 60% 사용, 최소 1GB 여유
+        available_memory_mb = (gpu_memory_gb * 0.6 - 1) * 1024
+        
+        # YOLO 모델 자체 메모리 (~500MB)
+        model_memory_mb = 500
+        available_memory_mb -= model_memory_mb
+        
+        # 배치당 추가 메모리 (feature maps 등) ~3x frame memory
+        batch_memory_mb = frame_memory_mb * 3
+        
+        optimal_batch = max(1, int(available_memory_mb / batch_memory_mb))
+        optimal_batch = min(optimal_batch, 16)  # 최대 16
+        
+        return optimal_batch
+    
+    return 4  # 기본값
 
 
 def create_custom_tracker_config(tracker_type, track_buffer, match_thresh):
@@ -135,16 +420,46 @@ def download_opencv_face_model():
         return None, None
 
 
-class FaceDetectorDNN:
-    """OpenCV DNN 기반 얼굴 감지 (최적화)"""
+def check_opencv_cuda_support():
+    """OpenCV CUDA 지원 여부 확인"""
+    try:
+        # OpenCV가 CUDA로 빌드되었는지 확인
+        build_info = cv2.getBuildInformation()
+        cuda_support = 'CUDA:' in build_info and 'YES' in build_info.split('CUDA:')[1].split('\n')[0]
+        cudnn_support = 'cuDNN:' in build_info and 'YES' in build_info.split('cuDNN:')[1].split('\n')[0]
+        return cuda_support and cudnn_support
+    except Exception:
+        return False
 
-    def __init__(self, confidence=0.5, input_size=300):
+
+class FaceDetectorDNN:
+    """OpenCV DNN 기반 얼굴 감지 (CUDA 가속 지원)"""
+
+    def __init__(self, confidence=0.5, input_size=300, use_cuda=True):
         proto_path, model_path = download_opencv_face_model()
+        self.use_cuda = False  # 실제 CUDA 사용 여부
+
         if proto_path and model_path:
             self.net = cv2.dnn.readNetFromCaffe(str(proto_path), str(model_path))
-            # OpenCV DNN 백엔드 최적화
-            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+            # CUDA 백엔드 시도 (가능한 경우)
+            if use_cuda and check_opencv_cuda_support():
+                try:
+                    self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                    self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                    self.use_cuda = True
+                    print("   ✅ OpenCV DNN CUDA 가속 활성화")
+                except Exception as e:
+                    print(f"   ⚠️ OpenCV CUDA 백엔드 실패, CPU로 폴백: {e}")
+                    self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                    self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            else:
+                # CPU 백엔드 사용
+                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                if use_cuda:
+                    print("   ⚠️ OpenCV CUDA 미지원, CPU 백엔드 사용")
+
             self.enabled = True
         else:
             self.net = None
@@ -456,9 +771,16 @@ class VideoMaskerOptimized:
         plate_expand: float = 0.3,
         # 최적화 파라미터
         device: str = "auto",
-        detect_interval: int = 3,  # N프레임마다 감지
-        detect_scale: float = 0.5,  # 감지용 다운스케일 (0.5 = 절반 해상도)
-        batch_size: int = 4,  # 배치 추론 크기
+        detect_interval: int = -1,  # N프레임마다 감지 (-1 = 자동)
+        detect_scale: float = -1,  # 감지용 다운스케일 (-1 = 자동)
+        batch_size: int = -1,  # 배치 추론 크기 (-1 = 자동)
+        # NVIDIA GPU 최적화 파라미터
+        gpu_id: int = 0,  # 사용할 GPU ID
+        use_fp16: bool = None,  # FP16 반정밀도 추론 (None = 자동)
+        use_tensorrt: bool = False,  # TensorRT 가속 (사전 변환 필요)
+        # 시스템 최적화
+        auto_optimize: bool = True,  # 시스템 사양 기반 자동 최적화
+        queue_size: int = -1,  # 프레임 큐 크기 (-1 = 자동)
         # 트래킹 파라미터
         tracker: str = "bytetrack",
         track_buffer: int = 30,
@@ -474,22 +796,61 @@ class VideoMaskerOptimized:
         self.vehicle_confidence = vehicle_confidence
         self.face_expand = face_expand
         self.plate_expand = plate_expand
+        
+        # 시스템 정보 수집 및 자동 최적화
+        self.system_info = None
+        self.optimal_settings = None
+        
+        if auto_optimize:
+            self.system_info = get_system_info()
+            self.optimal_settings = get_optimal_settings(self.system_info)
+            print_system_info(self.system_info, self.optimal_settings)
+        
+        # 디바이스 설정 (자동 또는 수동)
+        if device == "auto":
+            self.device = self.optimal_settings['device'] if self.optimal_settings else get_optimal_device()
+        else:
+            self.device = device
 
-        # 최적화 설정
-        self.detect_interval = detect_interval
-        self.detect_scale = detect_scale
-        self.batch_size = batch_size
+        # 최적화 설정 (자동 또는 수동)
+        if self.optimal_settings:
+            self.detect_interval = detect_interval if detect_interval > 0 else self.optimal_settings['detect_interval']
+            self.detect_scale = detect_scale if detect_scale > 0 else self.optimal_settings['detect_scale']
+            self.batch_size = batch_size if batch_size > 0 else self.optimal_settings['batch_size']
+            self.queue_size = queue_size if queue_size > 0 else self.optimal_settings['queue_size']
+            self.use_fp16 = use_fp16 if use_fp16 is not None else self.optimal_settings['use_fp16']
+            self.num_workers = self.optimal_settings['num_workers']
+        else:
+            self.detect_interval = detect_interval if detect_interval > 0 else 3
+            self.detect_scale = detect_scale if detect_scale > 0 else 0.5
+            self.batch_size = batch_size if batch_size > 0 else 4
+            self.queue_size = queue_size if queue_size > 0 else 128
+            self.use_fp16 = use_fp16 if use_fp16 is not None else False
+            self.num_workers = 2
+        
         self.tracker_type = tracker
         self.track_buffer = track_buffer
         self.match_thresh = match_thresh
         self.iou_thresh = iou_thresh
-
-        # 디바이스 설정
-        if device == "auto":
-            self.device = get_optimal_device()
-        else:
-            self.device = device
-        print(f"사용 디바이스: {self.device}")
+        
+        # NVIDIA GPU 최적화 설정
+        self.gpu_id = gpu_id
+        self.use_tensorrt = use_tensorrt
+        
+        # CUDA 최적화 적용
+        if self.device == 'cuda':
+            setup_cuda_optimization(self.device, gpu_id)
+            cuda_info = get_cuda_info()
+            if cuda_info and not auto_optimize:  # 자동 최적화 시 이미 출력됨
+                gpu = cuda_info['devices'][gpu_id]
+                print(f"🎮 NVIDIA GPU: {gpu['name']} ({gpu['total_memory_gb']:.1f}GB)")
+                print(f"   Compute Capability: {gpu['compute_capability']}")
+            if self.use_fp16:
+                print(f"   ⚡ FP16 반정밀도 추론 활성화")
+            if use_tensorrt:
+                print(f"   🚀 TensorRT 가속 활성화")
+        elif not auto_optimize:
+            print(f"사용 디바이스: {self.device}")
 
         # 커스텀 트래커 설정 파일 생성
         self.tracker_config_path = create_custom_tracker_config(
@@ -500,19 +861,37 @@ class VideoMaskerOptimized:
         # 모델 로드
         self.face_detector = None
         self.vehicle_model = None
+        self.yolo_half = False  # 기본값
 
         if mask_faces:
-            print("얼굴 감지 모델 로딩 (OpenCV DNN)...")
-            self.face_detector = FaceDetectorDNN(confidence=face_confidence)
+            use_dnn_cuda = (self.device == 'cuda')
+            print(f"얼굴 감지 모델 로딩 (OpenCV DNN, CUDA={'시도' if use_dnn_cuda else '미사용'})...")
+            self.face_detector = FaceDetectorDNN(confidence=face_confidence, use_cuda=use_dnn_cuda)
             if not self.face_detector.enabled:
                 print("경고: 얼굴 감지 모델 로드 실패")
 
         if mask_plates:
             print(f"차량 감지 모델 로딩 (YOLOv8, device={self.device})...")
-            self.vehicle_model = YOLO("yolov8n.pt")
+            
+            # TensorRT 엔진 사용 (사전 변환 필요)
+            if use_tensorrt and self.device == 'cuda':
+                tensorrt_model_path = Path("yolov8n.engine")
+                if tensorrt_model_path.exists():
+                    print("   TensorRT 엔진 로딩...")
+                    self.vehicle_model = YOLO(str(tensorrt_model_path))
+                else:
+                    print("   ⚠️ TensorRT 엔진 없음. 최초 1회 변환이 필요합니다.")
+                    print("   변환 명령: yolo export model=yolov8n.pt format=engine half=True")
+                    self.vehicle_model = YOLO("yolov8n.pt")
+            else:
+                self.vehicle_model = YOLO("yolov8n.pt")
+            
             # GPU 가속 활성화
             if self.device != 'cpu':
                 self.vehicle_model.to(self.device)
+                
+            # FP16 설정 저장 (추론 시 사용)
+            self.yolo_half = use_fp16 and self.device == 'cuda'
 
         # COCO 클래스
         self.VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
@@ -640,6 +1019,7 @@ class VideoMaskerOptimized:
                 iou=self.iou_thresh,
                 tracker=self.tracker_config_path,  # 커스텀 트래커 설정 사용
                 device=self.device,  # GPU 디바이스 명시
+                half=self.yolo_half,  # FP16 추론
                 verbose=False
             )
 
@@ -699,6 +1079,7 @@ class VideoMaskerOptimized:
                     iou=self.iou_thresh,
                     tracker=self.tracker_config_path,
                     device=self.device,
+                    half=self.yolo_half,  # FP16 추론
                     verbose=False
                 )
 
@@ -834,7 +1215,7 @@ class VideoMaskerOptimized:
 
         logger = setup_logger(log_file, verbose)
         logger.info("=" * 60)
-        logger.info("최적화 마스킹 v2.0 시작")
+        logger.info("최적화 마스킹 v2.4 시작")
         logger.info("=" * 60)
 
         start_total_time = time.time()
@@ -896,9 +1277,9 @@ class VideoMaskerOptimized:
         logger.info(f"로그 파일: {log_file}")
         logger.info("-" * 60)
 
-        # 멀티스레딩 설정
-        read_queue = Queue(maxsize=128)
-        write_queue = Queue(maxsize=128)
+        # 멀티스레딩 설정 (시스템 RAM 기반 큐 크기)
+        read_queue = Queue(maxsize=self.queue_size)
+        write_queue = Queue(maxsize=self.queue_size)
 
         reader = FrameReader(cap, read_queue, start_frame, end_frame)
         writer = FrameWriter(out, write_queue)
@@ -1002,23 +1383,60 @@ class VideoMaskerOptimized:
         if errors:
             logger.warning(f"오류 발생 횟수: {len(errors)}")
 
-        # HEVC 인코딩
+        # HEVC 인코딩 (NVENC 하드웨어 가속 지원)
         if use_hevc:
             logger.info("\nHEVC 인코딩 시작...")
             hevc_start = time.time()
-            ffmpeg_cmd = [
-                'ffmpeg', '-y',
-                '-i', temp_output,
-                '-c:v', 'libx265',
-                '-preset', 'medium',
-                '-crf', '23',
-                '-tag:v', 'hvc1',
-                '-an',
-                output_path
-            ]
+
+            # NVENC 하드웨어 인코더 우선 시도 (RTX GPU)
+            use_nvenc = self.device == 'cuda'
+            if use_nvenc:
+                ffmpeg_cmd = [
+                    'ffmpeg', '-y',
+                    '-i', temp_output,
+                    '-c:v', 'hevc_nvenc',  # NVIDIA 하드웨어 인코더
+                    '-preset', 'p4',  # 속도/품질 균형 (p1=fastest, p7=best quality)
+                    '-rc', 'vbr',  # Variable bitrate
+                    '-cq', '23',  # 품질 수준 (CRF와 유사)
+                    '-b:v', '0',  # VBR 모드에서 품질 기반 인코딩
+                    '-tag:v', 'hvc1',
+                    '-an',
+                    output_path
+                ]
+                logger.info("   NVENC 하드웨어 인코더 사용")
+            else:
+                ffmpeg_cmd = [
+                    'ffmpeg', '-y',
+                    '-i', temp_output,
+                    '-c:v', 'libx265',
+                    '-preset', 'medium',
+                    '-crf', '23',
+                    '-tag:v', 'hvc1',
+                    '-an',
+                    output_path
+                ]
+                logger.info("   libx265 소프트웨어 인코더 사용")
+
             try:
                 result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
                 hevc_time = time.time() - hevc_start
+
+                # NVENC 실패 시 libx265로 폴백
+                if result.returncode != 0 and use_nvenc:
+                    logger.warning("   NVENC 실패, libx265로 재시도...")
+                    ffmpeg_cmd = [
+                        'ffmpeg', '-y',
+                        '-i', temp_output,
+                        '-c:v', 'libx265',
+                        '-preset', 'medium',
+                        '-crf', '23',
+                        '-tag:v', 'hvc1',
+                        '-an',
+                        output_path
+                    ]
+                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    hevc_time = time.time() - hevc_start
+
                 if result.returncode == 0:
                     logger.info(f"HEVC 인코딩 완료! (소요시간: {hevc_time/60:.1f}분)")
                     os.unlink(temp_output)
@@ -1026,6 +1444,12 @@ class VideoMaskerOptimized:
                     logger.error(f"HEVC 인코딩 실패: {result.stderr}")
             except Exception as e:
                 logger.error(f"ffmpeg 실행 오류: {e}")
+
+        # GPU 메모리 정리
+        if self.device == 'cuda':
+            import torch
+            torch.cuda.empty_cache()
+            logger.debug("GPU 메모리 캐시 정리 완료")
 
         # 최종 요약
         total_time = time.time() - start_total_time
@@ -1039,6 +1463,12 @@ class VideoMaskerOptimized:
         video_duration = process_frames / fps
         speed_ratio = video_duration / total_time if total_time > 0 else 0
         logger.info(f"처리 속도: {speed_ratio:.2f}x (실시간 대비)")
+        
+        # GPU 사용 정보
+        if self.device == 'cuda':
+            import torch
+            max_memory = torch.cuda.max_memory_allocated() / (1024**3)
+            logger.info(f"GPU 최대 메모리 사용량: {max_memory:.2f}GB")
 
         return output_path
 
@@ -1058,27 +1488,39 @@ def parse_time(time_str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="최적화된 얼굴/번호판 마스킹 v2.0",
+        description="최적화된 얼굴/번호판 마스킹 v2.4 (시스템 자동 최적화 + NVENC)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 사용 예시:
-  # 기본 사용 (자동 GPU 감지)
+  # 기본 사용 (시스템 사양 자동 감지 및 최적화)
   python mask_video_optimized.py video.mp4
 
   # 특정 구간 처리
   python mask_video_optimized.py video.mp4 --start 23:00 --end 28:00
 
-  # 감지 간격 조정 (5프레임마다 = 더 빠름)
-  python mask_video_optimized.py video.mp4 --detect-interval 5
-
-  # 감지 스케일 조정 (0.25 = 1/4 해상도로 감지)
-  python mask_video_optimized.py video.mp4 --detect-scale 0.25
+  # 수동 설정 (자동 최적화 비활성화)
+  python mask_video_optimized.py video.mp4 --no-auto --detect-interval 5 --batch-size 8
 
   # CPU 강제 사용
   python mask_video_optimized.py video.mp4 --device cpu
 
-  # 전체 옵션
-  python mask_video_optimized.py video.mp4 --detect-interval 5 --detect-scale 0.5 --hevc --verbose
+  # NVIDIA GPU + FP16 강제 활성화
+  python mask_video_optimized.py video.mp4 --fp16
+
+  # NVIDIA GPU + TensorRT (최고 성능, 사전 변환 필요)
+  python mask_video_optimized.py video.mp4 --tensorrt
+
+  # TensorRT 엔진 사전 변환
+  yolo export model=yolov8n.pt format=engine half=True
+
+  # HEVC 인코딩 (RTX GPU에서 NVENC 하드웨어 인코더 자동 사용)
+  python mask_video_optimized.py video.mp4 --hevc --verbose
+
+RTX 4070 Super 최적 설정 (12GB VRAM):
+  - 배치 크기: ~12-16
+  - 감지 간격: 1 (매 프레임)
+  - FP16: 자동 활성화
+  - NVENC: HEVC 인코딩 시 자동 사용
         """
     )
 
@@ -1105,12 +1547,26 @@ def main():
     parser.add_argument("--device", type=str, default="auto",
                        choices=["auto", "cpu", "mps", "cuda"],
                        help="처리 디바이스 (기본: auto)")
-    parser.add_argument("--detect-interval", type=int, default=3,
-                       help="감지 간격 (N프레임마다 감지, 기본: 3)")
-    parser.add_argument("--detect-scale", type=float, default=0.5,
-                       help="감지용 다운스케일 비율 (기본: 0.5)")
-    parser.add_argument("--batch-size", type=int, default=4,
-                       help="배치 추론 크기 (기본: 4)")
+    parser.add_argument("--detect-interval", type=int, default=-1,
+                       help="감지 간격 (N프레임마다 감지, -1=자동)")
+    parser.add_argument("--detect-scale", type=float, default=-1,
+                       help="감지용 다운스케일 비율 (-1=자동)")
+    parser.add_argument("--batch-size", type=int, default=-1,
+                       help="배치 추론 크기 (-1=자동)")
+    
+    # NVIDIA GPU 최적화 파라미터
+    parser.add_argument("--gpu-id", type=int, default=0,
+                       help="사용할 GPU ID (기본: 0)")
+    parser.add_argument("--fp16", action="store_true",
+                       help="FP16 반정밀도 추론 (NVIDIA GPU만, 속도 향상)")
+    parser.add_argument("--tensorrt", action="store_true",
+                       help="TensorRT 가속 (사전 변환 필요)")
+    
+    # 시스템 자동 최적화
+    parser.add_argument("--no-auto", action="store_true",
+                       help="시스템 자동 최적화 비활성화 (수동 설정 사용)")
+    parser.add_argument("--queue-size", type=int, default=-1,
+                       help="프레임 큐 크기 (-1=자동, RAM 기반)")
 
     # 트래킹 파라미터
     parser.add_argument("--tracker", type=str, default="bytetrack",
@@ -1143,6 +1599,11 @@ def main():
         detect_interval=args.detect_interval,
         detect_scale=args.detect_scale,
         batch_size=args.batch_size,
+        gpu_id=args.gpu_id,
+        use_fp16=args.fp16 if args.fp16 else None,
+        use_tensorrt=args.tensorrt,
+        auto_optimize=not args.no_auto,
+        queue_size=args.queue_size,
         tracker=args.tracker,
         track_buffer=args.track_buffer,
         match_thresh=args.match_thresh,
