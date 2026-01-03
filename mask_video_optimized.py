@@ -891,7 +891,7 @@ class VideoMaskerOptimized:
                 self.vehicle_model.to(self.device)
                 
             # FP16 설정 저장 (추론 시 사용)
-            self.yolo_half = use_fp16 and self.device == 'cuda'
+            self.yolo_half = self.use_fp16 and self.device == 'cuda'
 
         # COCO 클래스
         self.VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck

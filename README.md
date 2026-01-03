@@ -249,7 +249,16 @@ tail -f masking.log
 
 ## 변경 이력
 
-### v2.4 - 2026-01-03 (현재)
+### v2.4.1 - 2026-01-03 (현재)
+
+**버그 수정**
+- **FP16 추론 오류 수정**: `yolo_half` 변수 초기화 시 잘못된 변수 참조 수정
+  - 이전: `self.yolo_half = use_fp16 and self.device == 'cuda'` (파라미터 `use_fp16`은 `None`일 수 있음)
+  - 수정: `self.yolo_half = self.use_fp16 and self.device == 'cuda'` (인스턴스 변수 사용)
+  - 증상: `unsupported operand type(s) for &=: 'NoneType' and 'bool'` 오류로 배치 처리 실패
+  - 영향: 모든 프레임에서 마스킹이 적용되지 않고 원본 프레임만 인코딩됨
+
+### v2.4 - 2026-01-03
 
 **NVIDIA CUDA 최적화**
 - **OpenCV DNN CUDA 백엔드 지원**: 얼굴 감지를 GPU에서 처리
