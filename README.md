@@ -81,6 +81,35 @@ pip로 설치되는 opencv-python 패키지는 CUDA 지원이 포함되어 있�
 
 ---
 
+## 빠른 시작 (Quick Start)
+
+### 1. 최초 실행 전 TensorRT 엔진 준비 (선택사항)
+
+최초 실행 시 TensorRT 엔진이 자동 생성되지만, 사전에 생성하면 시간을 절약할 수 있습니다.
+
+```bash
+source .venv/bin/activate
+
+# TensorRT 엔진 생성 (약 2-5분 소요)
+yolo export model=yolo12x.pt format=engine half=True device=0
+```
+
+### 2. 기본 실행
+
+```bash
+# 영상 마스킹 (사람 + 번호판)
+python mask_video.py input.mp4 --hevc
+```
+
+### 3. 출력 확인
+
+```bash
+# 출력 파일: input_masked.mp4 (기본 경로)
+ls -la input_masked.mp4
+```
+
+---
+
 ## 사용법
 
 ### 기본 실행
@@ -269,6 +298,89 @@ tail -f masking.log
 
 ---
 
+## 권장 파라미터 설정
+
+### 시나리오별 권장 설정
+
+#### 🎯 일반 사용 (품질 우선)
+
+```bash
+# 기본 설정 - 대부분의 경우 충분
+python mask_video.py video.mp4 --hevc
+
+# 자동 최적화가 적용됨:
+# - yolo12x TensorRT 모델
+# - GPU 블러 (blur-strength 31)
+# - NVDEC 디코딩 + NVENC 인코딩
+# - 시스템 RAM/VRAM 기반 자동 배치 크기
+```
+
+#### ⚡ 최대 속도 (처리량 우선)
+
+```bash
+# 고성능 모드 + FP16
+python mask_video.py video.mp4 --high-performance --fp16 --hevc
+
+# 또는 배치 크기 수동 지정
+python mask_video.py video.mp4 --batch-size 32 --detect-interval 2 --hevc
+```
+
+#### 🎬 여러 영상 동시 처리 (병렬 처리)
+
+```bash
+# 3개 영상 동시 처리 (RAM 32GB 기준)
+python mask_video.py video1.mp4 --queue-size 64 --hevc -o out1.mp4 &
+python mask_video.py video2.mp4 --queue-size 64 --hevc -o out2.mp4 &
+python mask_video.py video3.mp4 --queue-size 64 --hevc -o out3.mp4 &
+wait
+```
+
+#### 🔬 정확도 최대 (느리지만 정밀)
+
+```bash
+# 매 프레임 감지 + 큰 모델
+python mask_video.py video.mp4 --detect-interval 1 --yolo-model yolo12x --hevc
+```
+
+#### 💾 낮은 RAM 환경 (16GB 이하)
+
+```bash
+# 큐 크기 줄이기
+python mask_video.py video.mp4 --queue-size 32 --batch-size 8 --hevc
+```
+
+### 기본 파라미터 값 요약
+
+| 파라미터 | 기본값 | 설명 | 조정 시점 |
+|----------|--------|------|-----------|
+| `--yolo-model` | `yolo12x` | YOLO 모델 | 속도 필요시 `yolo11x` |
+| `--tensorrt` | `True` | TensorRT 가속 | 호환 문제시 `--no-tensorrt` |
+| `--fp16` | `False` | FP16 추론 | NVIDIA GPU에서 `--fp16` 권장 |
+| `--nvdec` | `True` | GPU 디코딩 | CPU 디코딩 필요시 `--no-nvdec` |
+| `--detect-interval` | `-1` (자동) | 감지 주기 | 정확도 필요시 `1`, 속도 필요시 `3-5` |
+| `--detect-scale` | `-1` (자동) | 감지 해상도 | 속도 필요시 `0.5` |
+| `--batch-size` | `-1` (자동) | 배치 크기 | VRAM 부족시 `8-16` |
+| `--queue-size` | `-1` (자동) | 프레임 큐 | 병렬 처리시 `64`, RAM 부족시 `32` |
+| `--blur-strength` | `31` | 블러 강도 | GPU는 31 이하 권장 |
+| `--person-conf` | `0.4` | 사람 감지 신뢰도 | 놓침 많으면 `0.3`, 오탐 많으면 `0.5` |
+| `--vehicle-conf` | `0.3` | 차량 감지 신뢰도 | 놓침 많으면 `0.2`, 오탐 많으면 `0.4` |
+| `--person-expand` | `0.2` | 사람 영역 확장 | 마스킹 부족시 `0.3` |
+| `--plate-expand` | `0.5` | 번호판 영역 확장 | 마스킹 부족시 `0.6-0.7` |
+| `--track-buffer` | `60` | 트래킹 버퍼 | 끊김 많으면 `90-120` |
+
+### 자동 최적화 (-1 = auto)
+
+`-1` 값은 시스템 사양에 따라 자동 설정됩니다:
+
+| 항목 | 자동 계산 기준 |
+|------|---------------|
+| `detect-interval` | VRAM 12GB 이상: 1, 미만: 2 |
+| `detect-scale` | 4K 영상: 0.5, FHD: 1.0 |
+| `batch-size` | VRAM의 70% 기준 계산 |
+| `queue-size` | RAM의 25% 기준, 최대 512 |
+
+---
+
 ## 성능 참고
 
 ### 테스트 환경
@@ -434,22 +546,104 @@ wait  # 모든 프로세스 완료 대기
 | ByteTrack | 객체 추적 | Ultralytics 내장 | **기본값** |
 | BoT-SORT | 객체 추적 | Ultralytics 내장 | 대안 |
 
-### TensorRT 엔진 생성
+### TensorRT 엔진 생성 (상세 가이드)
 
-TensorRT 엔진은 최초 실행 시 자동 생성되며, 시스템별로 다시 생성해야 합니다:
+TensorRT 엔진은 YOLO 모델을 GPU에 최적화하여 추론 속도를 2-3배 향상시킵니다.
+**최초 실행 시 자동 생성**되지만, 사전에 수동 생성하면 첫 실행 시간을 절약할 수 있습니다.
+
+> ⚠️ **주의**: `.engine` 파일은 **시스템 종속적**입니다. GPU, CUDA, TensorRT 버전이 다른 시스템에서는 재생성해야 합니다.
+
+#### 방법 1: YOLO CLI (권장)
 
 ```bash
-# 수동 엔진 생성 (선택사항)
+# 기본 FP16 엔진 생성 (권장)
 yolo export model=yolo12x.pt format=engine half=True device=0
+
+# 특정 배치 크기로 생성 (배치 추론용)
+yolo export model=yolo12x.pt format=engine half=True device=0 batch=32
+
+# 동적 배치 크기 엔진 (유연성 필요 시)
+yolo export model=yolo12x.pt format=engine half=True device=0 dynamic=True
 ```
 
-생성된 `.engine` 파일은 Git에 포함하지 않습니다 (시스템 종속적).
+#### 방법 2: trtexec (고급 설정)
+
+ONNX 모델을 거쳐 TensorRT 엔진을 세밀하게 제어할 수 있습니다.
+
+```bash
+# Step 1: PyTorch → ONNX 변환
+yolo export model=yolo12x.pt format=onnx half=True simplify=True opset=17
+
+# Step 2: ONNX → TensorRT 엔진 변환
+trtexec --onnx=yolo12x.onnx \
+        --saveEngine=yolo12x.engine \
+        --fp16 \
+        --workspace=4096 \
+        --verbose
+
+# 고정 배치 크기 (최적 성능)
+trtexec --onnx=yolo12x.onnx \
+        --saveEngine=yolo12x_b32.engine \
+        --fp16 \
+        --shapes=images:32x3x640x640 \
+        --workspace=4096
+
+# 동적 배치 크기 (유연성)
+trtexec --onnx=yolo12x.onnx \
+        --saveEngine=yolo12x_dynamic.engine \
+        --fp16 \
+        --minShapes=images:1x3x640x640 \
+        --optShapes=images:16x3x640x640 \
+        --maxShapes=images:64x3x640x640 \
+        --workspace=4096
+```
+
+#### 주요 trtexec 옵션
+
+| 옵션 | 설명 | 권장값 |
+|------|------|--------|
+| `--fp16` | FP16 반정밀도 (속도 2배, 정확도 유지) | **필수** |
+| `--workspace` | 빌드 시 GPU 메모리 (MB) | 4096 |
+| `--shapes` | 고정 입력 크기 (batch×channels×height×width) | 32x3x640x640 |
+| `--minShapes/optShapes/maxShapes` | 동적 배치 범위 | 1/16/64 |
+| `--best` | INT8 양자화 (캘리브레이션 필요) | 선택적 |
+
+#### 배치 크기별 엔진 파일 관리
+
+```bash
+# 여러 배치 크기 엔진 사전 생성
+for bs in 16 24 32 48 64; do
+  yolo export model=yolo12x.pt format=engine half=True device=0 batch=$bs
+  mv yolo12x.engine yolo12x_b${bs}.engine
+done
+```
+
+#### 엔진 파일 위치
+
+생성된 `.engine` 파일은 모델 파일과 같은 디렉토리에 저장됩니다:
+- 자동 생성: `~/.cache/ultralytics/` 또는 현재 디렉토리
+- 수동 지정: `--yolo-model /path/to/yolo12x.engine`
+
+> 💡 **팁**: Git에 `.engine` 파일을 포함하지 마세요 (`.gitignore`에 추가)
 
 ---
 
 ## 변경 이력
 
-### v3.2 - 2026-01-04 (현재)
+### v3.3 - 2026-01-05 (현재)
+
+**문서 개선**
+- **TensorRT 엔진 제작 가이드 강화**:
+  - YOLO CLI 및 trtexec 사용법 상세 설명
+  - 배치 크기별 엔진 파일 관리 방법
+  - 동적 배치 vs 고정 배치 엔진 비교
+- **권장 파라미터 설정 섹션 추가**:
+  - 시나리오별 권장 설정 (품질/속도/병렬/정확도/저사양)
+  - 기본 파라미터 값 요약 표
+  - 자동 최적화(-1) 계산 기준 설명
+- **빠른 시작 가이드 추가**: TensorRT 엔진 사전 생성 안내
+
+### v3.2 - 2026-01-04
 
 **YOLO 모델 업그레이드**
 - **기본 모델 변경**: yolov8n → **yolo12x** (최신 고정확도 모델)
