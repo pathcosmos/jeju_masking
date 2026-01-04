@@ -97,7 +97,7 @@ def main():
     parser.add_argument("--no-plates", action="store_true", help="번호판 마스킹 비활성화")
     parser.add_argument("--mask-type", choices=["blur", "mosaic"], default="blur",
                        help="마스킹 방식 (기본: blur)")
-    parser.add_argument("--blur-strength", type=int, default=51,
+    parser.add_argument("--blur-strength", type=int, default=31,  # GPU 최적화 (31 이하)
                        help="블러 강도 (기본: 51)")
     parser.add_argument("--mosaic-size", type=int, default=15,
                        help="모자이크 블록 크기 (기본: 15)")
@@ -107,10 +107,10 @@ def main():
                        help="사람 감지 신뢰도 (기본: 0.4)")
     parser.add_argument("--vehicle-conf", type=float, default=0.3,
                        help="차량 감지 신뢰도 (기본: 0.3)")
-    parser.add_argument("--person-expand", type=float, default=0.1,
-                       help="사람 영역 확장 비율 (기본: 0.1)")
-    parser.add_argument("--plate-expand", type=float, default=0.3,
-                       help="번호판 영역 확장 비율 (기본: 0.3)")
+    parser.add_argument("--person-expand", type=float, default=0.2,
+                       help="사람 영역 확장 비율 (기본: 0.2, 여유있게 마스킹)")
+    parser.add_argument("--plate-expand", type=float, default=0.5,
+                       help="번호판 영역 확장 비율 (기본: 0.5, 여유있게 마스킹)")
     parser.add_argument("--plate-detect", type=str, default="auto",
                        choices=["auto", "multi", "legacy"],
                        help="번호판 감지 모드: auto=OpenCV 자동감지, multi=다중위치, legacy=하단만 (기본: auto)")
@@ -133,8 +133,15 @@ def main():
                        help="고성능 모드: FFmpeg 파이프라인 + 진정한 배치 추론 (CUDA 필수)")
     parser.add_argument("--fp16", action="store_true",
                        help="FP16 반정밀도 추론 (NVIDIA GPU)")
-    parser.add_argument("--tensorrt", action="store_true",
-                       help="TensorRT 가속")
+    parser.add_argument("--tensorrt", action="store_true", default=True,
+                       help="TensorRT 가속 (기본: 활성화, .engine 파일 필요)")
+    parser.add_argument("--no-tensorrt", action="store_true",
+                       help="TensorRT 비활성화 (PyTorch 모델 사용)")
+    parser.add_argument("--yolo-model", type=str, default="yolo12x",
+                       choices=["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x",
+                                "yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x",
+                                "yolo12n", "yolo12s", "yolo12m", "yolo12l", "yolo12x"],
+                       help="YOLO 모델 (기본: yolo12x, 최신/최고정확도)")
     parser.add_argument("--no-auto", action="store_true",
                        help="자동 최적화 비활성화")
 
@@ -142,8 +149,14 @@ def main():
     parser.add_argument("--tracker", type=str, default="bytetrack",
                        choices=["bytetrack", "botsort"],
                        help="트래커 종류 (기본: bytetrack)")
-    parser.add_argument("--track-buffer", type=int, default=30,
-                       help="트래킹 버퍼 (기본: 30)")
+    parser.add_argument("--track-buffer", type=int, default=60,
+                       help="트래킹 버퍼 - 감지 누락 시 유지할 프레임 수 (기본: 60)")
+
+    # 하드웨어 가속 디코딩
+    parser.add_argument("--nvdec", action="store_true", default=True,
+                       help="NVDEC GPU 디코딩 활성화 (기본: 활성화)")
+    parser.add_argument("--no-nvdec", dest="nvdec", action="store_false",
+                       help="NVDEC 비활성화 (CPU 디코딩 사용)")
 
     # 출력 옵션
     parser.add_argument("--hevc", action="store_true", help="HEVC 인코딩")
@@ -210,10 +223,12 @@ def main():
             batch_size=args.batch_size,
             high_performance=args.high_performance,
             use_fp16=args.fp16 if args.fp16 else None,
-            use_tensorrt=args.tensorrt,
+            use_tensorrt=args.tensorrt and not args.no_tensorrt,
+            yolo_model=args.yolo_model,
             auto_optimize=not args.no_auto,
             tracker=args.tracker,
             track_buffer=args.track_buffer,
+            use_nvdec=args.nvdec,
         )
 
         # 2-Pass 모드 분기

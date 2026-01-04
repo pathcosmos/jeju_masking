@@ -22,6 +22,7 @@ models/
 *.pth
 *.onnx
 *.weights
+*.engine
 
 # 로그 파일
 *.log
@@ -39,6 +40,10 @@ logs/
 *.temp
 tmp/
 temp/
+
+# 벤치마크/테스트 파일
+benchmark_*.py
+PERFORMANCE_ANALYSIS.md
 
 # Claude Code
 .claude/

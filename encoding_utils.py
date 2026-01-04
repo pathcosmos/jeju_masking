@@ -124,12 +124,14 @@ def get_optimal_settings(system_info, frame_width=3840, frame_height=2160):
         if major_version >= 7 and gpu.get('type') == 'cuda':
             settings['use_fp16'] = True
 
-        if vram_gb >= 12:
-            settings['detect_scale'] = 0.6
+        if vram_gb >= 11.5:  # 12GB VRAM (11.99GB로 인식되는 경우 포함)
+            settings['detect_scale'] = 0.8  # 고해상도 감지
             settings['detect_interval'] = 1
-            settings['nvenc_preset'] = 'p4'
-            settings['nvenc_lookahead'] = 32
-            settings['nvenc_bframes'] = 4
+            settings['batch_size'] = 48  # 큰 배치
+            settings['queue_size'] = 512  # 안정적인 버퍼
+            settings['nvenc_preset'] = 'p5'  # 고품질 인코딩
+            settings['nvenc_lookahead'] = 32  # 안정적인 lookahead
+            settings['nvenc_bframes'] = 3
         elif vram_gb >= 8:
             settings['detect_scale'] = 0.5
             settings['detect_interval'] = 2
@@ -198,6 +200,9 @@ def build_nvenc_command(output_path, width, height, fps, settings, use_hevc=Fals
     bframes = settings.get('nvenc_bframes', 3)
     if bframes > 0:
         cmd.extend(['-bf', str(bframes), '-b_ref_mode', 'middle'])
+
+    # 출력 픽셀 포맷 명시 (색상 왜곡 방지)
+    cmd.extend(['-pix_fmt', 'yuv420p'])
 
     if use_hevc:
         cmd.extend(['-tag:v', 'hvc1'])

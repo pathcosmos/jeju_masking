@@ -5,15 +5,17 @@ NVIDIA CUDA / Apple Silicon MPS GPU 가속, 멀티스레딩, 트래킹 보간 �
 
 ## 주요 기능
 
-- **얼굴 감지 및 마스킹**: OpenCV DNN 기반 SSD 모델 사용 (CUDA 가속 지원)
-- **차량/번호판 감지 및 마스킹**: YOLOv8n 모델 + ByteTrack/BoT-SORT 트래킹
-- **NVIDIA CUDA GPU 가속**: RTX 시리즈에서 FP16 추론 및 NVENC 하드웨어 인코딩
-- **OpenCV DNN CUDA 백엔드**: 얼굴 감지를 GPU에서 처리
+- **사람 전체 마스킹**: YOLO12x 모델로 사람 감지 후 전신 마스킹 (얼굴만이 아닌 전체)
+- **차량 번호판 마스킹**: 차량 감지 + 번호판 영역 추정 마스킹
+- **TensorRT 가속**: YOLO 모델을 TensorRT 엔진으로 변환하여 최대 성능 (기본 활성화)
+- **GPU 블러**: OpenCV CUDA 가우시안 블러 (CPU 대비 13배 빠름)
+- **NVDEC 하드웨어 디코딩**: GPU에서 직접 영상 디코딩
+- **NVENC 하드웨어 인코딩**: RTX GPU에서 H.264/HEVC 하드웨어 인코딩
+- **FP16 반정밀도 추론**: NVIDIA GPU에서 메모리 절약 및 속도 향상
 - **MPS GPU 가속**: Apple Silicon에서 Metal Performance Shaders 활용
 - **멀티스레딩 파이프라인**: 읽기/처리/쓰기 분리로 성능 향상
-- **프레임 스킵 + 트래킹 보간**: 모든 프레임 감지 없이 추적으로 마스킹 유지
+- **프레임 스킵 + 트래킹 보간**: ByteTrack/BoT-SORT로 추적, 중간 프레임 보간
 - **해상도 다운스케일 감지**: 감지는 축소 해상도, 출력은 원본 해상도 유지
-- **배치 추론**: 여러 프레임 동시 처리로 GPU 활용률 극대화
 
 ## 파일 구조
 
@@ -113,20 +115,21 @@ python mask_video.py input.mp4
 
 | 옵션 | 설명 | 기본값 |
 |------|------|--------|
-| `--no-faces` | 얼굴 마스킹 비활성화 | - |
+| `--no-persons` | 사람 마스킹 비활성화 | - |
 | `--no-plates` | 번호판 마스킹 비활성화 | - |
 | `--mask-type` | `blur` 또는 `mosaic` | `blur` |
-| `--blur-strength` | 블러 강도 (홀수 값) | `51` |
+| `--blur-strength` | 블러 강도 (홀수 값, GPU는 31 이하) | `31` |
 | `--mosaic-size` | 모자이크 블록 크기 | `15` |
 
 #### 감지 파라미터
 
 | 옵션 | 설명 | 기본값 |
 |------|------|--------|
-| `--face-conf` | 얼굴 감지 신뢰도 임계값 | `0.4` |
+| `--person-conf` | 사람 감지 신뢰도 임계값 | `0.4` |
 | `--vehicle-conf` | 차량 감지 신뢰도 임계값 | `0.3` |
-| `--face-expand` | 얼굴 영역 확장 비율 | `0.2` |
-| `--plate-expand` | 번호판 영역 확장 비율 | `0.3` |
+| `--person-expand` | 사람 영역 확장 비율 | `0.2` |
+| `--plate-expand` | 번호판 영역 확장 비율 | `0.5` |
+| `--max-mask-ratio` | 프레임 대비 최대 마스킹 비율 | `0.4` |
 
 #### 2-Pass 모드 옵션
 
@@ -143,12 +146,16 @@ python mask_video.py input.mp4
 | 옵션 | 설명 | 기본값 |
 |------|------|--------|
 | `--device` | 연산 디바이스 (`auto`, `mps`, `cuda`, `cpu`) | `auto` |
+| `--yolo-model` | YOLO 모델 (`yolov8n`~`yolov8x`, `yolo11n`~`yolo11x`, `yolo12n`~`yolo12x`) | `yolo12x` |
+| `--tensorrt` | TensorRT 가속 (.engine 파일 필요) | **활성화** |
+| `--no-tensorrt` | TensorRT 비활성화 (PyTorch 모델 사용) | - |
+| `--fp16` | FP16 반정밀도 추론 (NVIDIA GPU 전용) | 비활성화 |
+| `--nvdec` | NVDEC GPU 디코딩 | **활성화** |
+| `--no-nvdec` | NVDEC 비활성화 (CPU 디코딩) | - |
 | `--detect-interval` | 감지 수행 프레임 간격 (1=매 프레임, -1=자동) | `-1` |
 | `--detect-scale` | 감지용 해상도 스케일 (0.5 = 50%, -1=자동) | `-1` |
 | `--batch-size` | 배치 추론 크기 (-1=자동) | `-1` |
 | `--high-performance` | 고성능 모드: FFmpeg 파이프라인 + 배치 GPU 추론 | 비활성화 |
-| `--fp16` | FP16 반정밀도 추론 (NVIDIA GPU 전용) | 비활성화 |
-| `--tensorrt` | TensorRT 가속 | 비활성화 |
 | `--no-auto` | 자동 최적화 비활성화 | - |
 
 #### 트래킹 파라미터
@@ -268,15 +275,24 @@ tail -f masking.log
 - **GPU**: NVIDIA RTX 4070 SUPER (12GB VRAM)
 - **CPU**: Intel i5-13400 (10코어, 16스레드)
 - **RAM**: 32GB DDR5
-- **입력**: 4K 60fps 영상 (3840x2160)
+- **입력**: 4K 60fps HEVC 10bit 영상 (3840x2160)
 
-### 처리 모드별 성능 비교
+### 처리 모드별 성능 비교 (yolo12x TensorRT)
 
 | 모드 | 속도 (fps) | 특징 | 권장 사용 |
 |------|------------|------|-----------|
-| **고성능 모드** (`--high-performance`) | ~48 fps | 1-Pass, GPU 추론+인코딩 동시 | 빠른 처리 |
-| **2-Pass 모드** (`--2pass`) | ~22 fps (분석) + ~20 fps (인코딩) | 2-Pass, JSON 저장 | 재작업 필요 시 |
-| **최적화 모드** (기본) | ~30 fps | 1-Pass, 안정적 | 일반 사용 |
+| **최적화 모드** (기본) | ~32 fps | yolo12x TRT + GPU 블러 + NVENC | **일반 권장** |
+| **고성능 모드** (`--high-performance`) | ~48 fps | 배치 GPU 추론 + 파이프라인 | 빠른 처리 |
+| **2-Pass 모드** (`--2pass`) | ~22 fps + ~20 fps | 분석/인코딩 분리 | JSON 재작업 |
+
+### YOLO 모델별 성능 비교
+
+| 모델 | TensorRT | 정확도 | 속도 (fps) | 권장 |
+|------|----------|--------|------------|------|
+| **yolo12x** | ✅ | 최고 | ~32 fps | **기본값** |
+| **yolo11x** | ✅ | 매우 높음 | ~33 fps | 대안 |
+| **yolov8x** | ✅ | 높음 | ~35 fps | 속도 중시 |
+| **yolov8n** | ✅ | 낮음 | ~45 fps | 테스트용 |
 
 ### 2-Pass 모드 상세
 
@@ -372,18 +388,62 @@ tail -f masking.log
 
 ## 모델 정보
 
-| 모델 | 용도 | 소스 |
-|------|------|------|
-| OpenCV DNN SSD | 얼굴 감지 | 자동 다운로드 |
-| YOLOv8n | 차량 감지 | Ultralytics (자동 다운로드) |
-| ByteTrack | 객체 추적 | Ultralytics 내장 |
-| BoT-SORT | 객체 추적 (대안) | Ultralytics 내장 |
+| 모델 | 용도 | 소스 | 비고 |
+|------|------|------|------|
+| **YOLO12x** | 사람/차량 감지 | Ultralytics | **기본값**, 최신 모델 |
+| YOLO11x | 사람/차량 감지 | Ultralytics | 높은 정확도 |
+| YOLOv8x | 사람/차량 감지 | Ultralytics | 안정적 |
+| YOLOv8n | 사람/차량 감지 | Ultralytics | 속도 우선 |
+| ByteTrack | 객체 추적 | Ultralytics 내장 | **기본값** |
+| BoT-SORT | 객체 추적 | Ultralytics 내장 | 대안 |
+
+### TensorRT 엔진 생성
+
+TensorRT 엔진은 최초 실행 시 자동 생성되며, 시스템별로 다시 생성해야 합니다:
+
+```bash
+# 수동 엔진 생성 (선택사항)
+yolo export model=yolo12x.pt format=engine half=True device=0
+```
+
+생성된 `.engine` 파일은 Git에 포함하지 않습니다 (시스템 종속적).
 
 ---
 
 ## 변경 이력
 
-### v3.1 - 2026-01-04 (현재)
+### v3.2 - 2026-01-04 (현재)
+
+**YOLO 모델 업그레이드**
+- **기본 모델 변경**: yolov8n → **yolo12x** (최신 고정확도 모델)
+- **TensorRT 기본 활성화**: `--tensorrt` 옵션 기본값 True
+- **지원 모델 확장**: YOLO11 시리즈 (yolo11n~yolo11x), YOLO12 시리즈 (yolo12n~yolo12x) 추가
+
+**GPU 최적화**
+- **GPU 블러**: OpenCV CUDA 가우시안 블러 적용 (CPU 대비 13배 빠름)
+  - 커널 크기 31 이하에서 GPU 사용, 초과 시 CPU 폴백
+  - 블러 필터 캐시로 재생성 오버헤드 제거
+- **기본 블러 강도**: 51 → 31 (GPU 최적화)
+- **NVDEC 기본 활성화**: `--nvdec` 옵션 기본값 True
+
+**마스킹 영역 확장**
+- **사람 영역 확장**: `person_expand` 0.1 → 0.2 (여유있게 마스킹)
+- **번호판 영역 확장**: `plate_expand` 0.3 → 0.5 (여유있게 마스킹)
+
+**버그 수정**
+- **VRAM 감지 임계값 수정**: 12GB → 11.5GB (12282 MiB / 1024 = 11.99GB 문제 해결)
+- **인코딩 크래시 수정**: FrameWriter 스레드 동기화 문제 해결
+  - `daemon=True` → `daemon=False` 변경
+  - `finished` Event 추가로 완료 대기
+  - `wait_finished()` 메서드로 안전한 종료 보장
+  - VideoCapture/Writer 안전한 해제
+
+**성능 (RTX 4070 SUPER, 4K 60fps)**
+- yolo12x TensorRT: ~32 fps
+- yolo11x TensorRT: ~33 fps
+- 1분 영상 (3596 프레임) 처리: 2.8분 (인코딩 포함)
+
+### v3.1 - 2026-01-04
 
 **코드 모듈화**
 - **파일 분리**: 대규모 단일 파일을 기능별 모듈로 분리

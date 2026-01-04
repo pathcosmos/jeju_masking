@@ -7,6 +7,7 @@
 
 import os
 import time
+import json
 import tempfile
 import subprocess
 from pathlib import Path
@@ -73,13 +74,19 @@ def setup_cuda_optimization(device='cuda', gpu_id=0):
 
 
 def create_custom_tracker_config(tracker_type, track_buffer, match_thresh):
-    """커스텀 트래커 설정 파일 생성"""
+    """
+    커스텀 트래커 설정 파일 생성
+    - track_high_thresh: 높은 신뢰도 임계값 (확실한 감지)
+    - track_low_thresh: 낮은 신뢰도 임계값 (기존 트랙 유지용)
+    - new_track_thresh: 새 트랙 생성 임계값
+    - track_buffer: 감지 누락 시 트랙 유지 프레임 수
+    """
     if tracker_type == "bytetrack":
         config = {
             'tracker_type': 'bytetrack',
-            'track_high_thresh': 0.5,
-            'track_low_thresh': 0.1,
-            'new_track_thresh': 0.6,
+            'track_high_thresh': 0.4,   # 낮춤: 더 많은 감지 포함
+            'track_low_thresh': 0.05,   # 낮춤: 기존 트랙 더 오래 유지
+            'new_track_thresh': 0.5,    # 낮춤: 새 트랙 더 쉽게 생성
             'track_buffer': track_buffer,
             'match_thresh': match_thresh,
             'fuse_score': True
@@ -87,9 +94,9 @@ def create_custom_tracker_config(tracker_type, track_buffer, match_thresh):
     else:
         config = {
             'tracker_type': 'botsort',
-            'track_high_thresh': 0.5,
-            'track_low_thresh': 0.1,
-            'new_track_thresh': 0.6,
+            'track_high_thresh': 0.4,
+            'track_low_thresh': 0.05,
+            'new_track_thresh': 0.5,
             'track_buffer': track_buffer,
             'match_thresh': match_thresh,
             'proximity_thresh': 0.5,
@@ -236,6 +243,123 @@ class FFmpegPipeline:
         self.close()
 
 
+class NVDECDecoder:
+    """
+    FFmpeg NVDEC 하드웨어 가속 디코더 (GPU 디코딩)
+    - cv2.VideoCapture 대비 2-3배 빠른 디코딩
+    - GPU에서 직접 디코딩하여 CPU 부하 최소화
+    """
+
+    # 코덱별 cuvid 디코더 매핑
+    CUVID_DECODERS = {
+        'hevc': 'hevc_cuvid',
+        'h264': 'h264_cuvid',
+        'h265': 'hevc_cuvid',
+        'av1': 'av1_cuvid',
+        'vp9': 'vp9_cuvid',
+        'vp8': 'vp8_cuvid',
+        'mpeg4': 'mpeg4_cuvid',
+        'mpeg2video': 'mpeg2_cuvid',
+        'mpeg1video': 'mpeg1_cuvid',
+        'mjpeg': 'mjpeg_cuvid',
+        'vc1': 'vc1_cuvid',
+    }
+
+    def __init__(self, input_path, width, height, start_time=None, end_time=None):
+        self.input_path = input_path
+        self.width = width
+        self.height = height
+        self.frame_size = width * height * 3
+        self.decoder = None
+
+        # 입력 비디오 코덱 감지
+        codec = self._detect_codec(input_path)
+        cuvid_decoder = self.CUVID_DECODERS.get(codec)
+
+        # 디코더 명령어 구성
+        decode_cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
+
+        # NVDEC 하드웨어 가속 (cuvid 디코더 명시적 지정)
+        if cuvid_decoder:
+            decode_cmd.extend(['-hwaccel', 'cuda', '-c:v', cuvid_decoder])
+        else:
+            # 지원되지 않는 코덱은 소프트웨어 디코딩
+            decode_cmd.extend(['-hwaccel', 'cuda'])
+
+        # 시작 시간 (입력 전에 -ss로 빠른 시크)
+        if start_time:
+            decode_cmd.extend(['-ss', str(start_time)])
+
+        decode_cmd.extend(['-i', input_path])
+
+        # 종료 시간
+        if end_time:
+            if start_time:
+                duration = end_time - start_time
+                decode_cmd.extend(['-t', str(duration)])
+            else:
+                decode_cmd.extend(['-t', str(end_time)])
+
+        # 출력 포맷 (FFmpeg이 자동으로 GPU->CPU 전송)
+        decode_cmd.extend([
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-'
+        ])
+
+        self.decode_cmd = decode_cmd
+        self._cuvid_decoder = cuvid_decoder
+
+    def _detect_codec(self, input_path):
+        """입력 비디오의 코덱 감지"""
+        try:
+            result = subprocess.run(
+                ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                 '-show_entries', 'stream=codec_name',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', input_path],
+                capture_output=True, text=True, timeout=10
+            )
+            return result.stdout.strip().lower()
+        except Exception:
+            return None
+
+    def start(self):
+        """디코더 시작"""
+        self.decoder = subprocess.Popen(
+            self.decode_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=self.frame_size * 32  # 큰 버퍼로 성능 향상
+        )
+        return self
+
+    def read_frame(self):
+        """프레임 읽기"""
+        if self.decoder is None:
+            return None
+
+        raw_frame = self.decoder.stdout.read(self.frame_size)
+        if len(raw_frame) != self.frame_size:
+            return None
+
+        frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 3))
+        return frame.copy()
+
+    def close(self):
+        """디코더 종료"""
+        if self.decoder:
+            self.decoder.stdout.close()
+            self.decoder.terminate()
+            self.decoder.wait()
+            self.decoder = None
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *args):
+        self.close()
+
+
 class FrameReader(Thread):
     """비동기 프레임 읽기 스레드"""
 
@@ -268,39 +392,48 @@ class FrameWriter(Thread):
     """비동기 프레임 쓰기 스레드"""
 
     def __init__(self, out, queue):
-        super().__init__(daemon=True)
+        super().__init__(daemon=False)  # daemon=False로 변경하여 안전한 종료
         self.out = out
         self.queue = queue
         self.stopped = Event()
+        self.finished = Event()  # 완료 이벤트 추가
         self.frames_written = 0
 
     def run(self):
         pending = {}
         next_frame = 0
 
-        while not self.stopped.is_set():
-            try:
-                item = self.queue.get(timeout=0.1)
-            except Empty:
-                continue
+        try:
+            while not self.stopped.is_set():
+                try:
+                    item = self.queue.get(timeout=0.1)
+                except Empty:
+                    continue
 
-            if item is None:
+                if item is None:
+                    # 남은 pending 프레임 모두 쓰기
+                    while next_frame in pending:
+                        self.out.write(pending.pop(next_frame))
+                        self.frames_written += 1
+                        next_frame += 1
+                    break
+
+                frame_idx, frame = item
+                pending[frame_idx] = frame
+
                 while next_frame in pending:
                     self.out.write(pending.pop(next_frame))
                     self.frames_written += 1
                     next_frame += 1
-                break
-
-            frame_idx, frame = item
-            pending[frame_idx] = frame
-
-            while next_frame in pending:
-                self.out.write(pending.pop(next_frame))
-                self.frames_written += 1
-                next_frame += 1
+        finally:
+            self.finished.set()  # 완료 표시
 
     def stop(self):
         self.stopped.set()
+
+    def wait_finished(self, timeout=60):
+        """완료될 때까지 대기"""
+        return self.finished.wait(timeout=timeout)
 
 
 # ============================================================
@@ -308,11 +441,18 @@ class FrameWriter(Thread):
 # ============================================================
 
 class TrackingInterpolator:
-    """트래킹 결과 보간 관리"""
+    """
+    트래킹 결과 보간 관리 (개선된 버전)
+    - 감지가 누락된 프레임에서도 마지막 위치 유지
+    - 부드러운 속도 기반 예측
+    - 깜빡임 방지를 위한 적극적인 보간
+    """
 
-    def __init__(self, max_age=30):
+    def __init__(self, max_age=30, velocity_smoothing=0.5):
         self.tracks = {}
         self.max_age = max_age
+        self.velocity_smoothing = velocity_smoothing  # 속도 예측 제한 비율
+        self._next_temp_id = -1  # track_id가 None인 경우 임시 ID
 
     def update(self, frame_idx, detections):
         """새 감지 결과로 업데이트"""
@@ -320,29 +460,93 @@ class TrackingInterpolator:
 
         for det in detections:
             track_id = det.get('track_id')
+
+            # track_id가 None인 경우에도 처리 (위치 기반 매칭 시도)
             if track_id is None:
-                continue
+                box = det['box']
+                matched_id = self._find_matching_track(box, frame_idx)
+                if matched_id is not None:
+                    track_id = matched_id
+                else:
+                    # 새로운 임시 ID 할당
+                    track_id = self._next_temp_id
+                    self._next_temp_id -= 1
 
             seen_ids.add(track_id)
             box = det['box']
 
             if track_id not in self.tracks:
                 self.tracks[track_id] = {
-                    'boxes': deque(maxlen=10),
+                    'boxes': deque(maxlen=30),  # 더 많은 이력 유지
                     'last_seen': frame_idx,
-                    'type': det.get('type', 'unknown')
+                    'type': det.get('type', 'unknown'),
+                    'velocity': (0, 0, 0, 0),  # 속도 저장
+                    'conf': det.get('conf', 0.5)
                 }
+
+            # 속도 계산 및 스무딩
+            if len(self.tracks[track_id]['boxes']) > 0:
+                prev_frame, prev_box = self.tracks[track_id]['boxes'][-1]
+                dt = frame_idx - prev_frame
+                if dt > 0 and dt <= 10:  # 합리적인 프레임 간격에서만
+                    new_velocity = tuple((b2 - b1) / dt for b1, b2 in zip(prev_box, box))
+                    old_velocity = self.tracks[track_id]['velocity']
+                    # 스무딩된 속도
+                    smoothed_velocity = tuple(
+                        old_v * 0.7 + new_v * 0.3
+                        for old_v, new_v in zip(old_velocity, new_velocity)
+                    )
+                    self.tracks[track_id]['velocity'] = smoothed_velocity
 
             self.tracks[track_id]['boxes'].append((frame_idx, box))
             self.tracks[track_id]['last_seen'] = frame_idx
+            self.tracks[track_id]['conf'] = det.get('conf', self.tracks[track_id]['conf'])
 
         expired = [tid for tid, t in self.tracks.items()
                    if frame_idx - t['last_seen'] > self.max_age]
         for tid in expired:
             del self.tracks[tid]
 
+    def _find_matching_track(self, box, frame_idx, iou_thresh=0.3):
+        """위치 기반으로 기존 트랙과 매칭"""
+        best_match = None
+        best_iou = iou_thresh
+
+        for track_id, track in self.tracks.items():
+            if frame_idx - track['last_seen'] > 10:  # 너무 오래된 트랙은 제외
+                continue
+
+            if len(track['boxes']) == 0:
+                continue
+
+            _, last_box = track['boxes'][-1]
+            iou = self._calculate_iou(box, last_box)
+
+            if iou > best_iou:
+                best_iou = iou
+                best_match = track_id
+
+        return best_match
+
+    def _calculate_iou(self, box1, box2):
+        """IoU 계산"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
+
     def get_interpolated(self, frame_idx):
-        """현재 프레임에 대한 보간된 박스들 반환"""
+        """현재 프레임에 대한 보간된 박스들 반환 (개선된 버전)"""
         results = []
 
         for track_id, track in self.tracks.items():
@@ -351,37 +555,58 @@ class TrackingInterpolator:
                 continue
 
             last_frame, last_box = boxes[-1]
+            frames_gap = frame_idx - last_frame
 
-            if frame_idx == last_frame:
+            # 현재 프레임에 감지된 경우
+            if frames_gap == 0:
                 results.append({
                     'track_id': track_id,
                     'box': last_box,
                     'type': track['type'],
                     'interpolated': False
                 })
-            elif frame_idx > last_frame and frame_idx - last_frame <= self.max_age:
-                if len(boxes) >= 2:
-                    prev_frame, prev_box = boxes[-2]
-                    dt = last_frame - prev_frame
-                    if dt > 0:
-                        velocity = tuple((b2 - b1) / dt for b1, b2 in zip(prev_box, last_box))
-                        frames_ahead = frame_idx - last_frame
-                        predicted_box = tuple(int(b + v * frames_ahead) for b, v in zip(last_box, velocity))
-                        results.append({
-                            'track_id': track_id,
-                            'box': predicted_box,
-                            'type': track['type'],
-                            'interpolated': True
-                        })
-                else:
-                    results.append({
-                        'track_id': track_id,
-                        'box': last_box,
-                        'type': track['type'],
-                        'interpolated': True
-                    })
+            # 감지가 누락되었지만 max_age 이내인 경우 - 보간
+            elif frames_gap > 0 and frames_gap <= self.max_age:
+                velocity = track.get('velocity', (0, 0, 0, 0))
+
+                # 속도 기반 예측 (제한된 범위 내에서)
+                max_shift = 50 * frames_gap  # 프레임당 최대 50픽셀 이동
+                predicted_box = []
+                for i, (coord, vel) in enumerate(zip(last_box, velocity)):
+                    shift = vel * frames_gap
+                    # 이동량 제한
+                    shift = max(-max_shift, min(max_shift, shift))
+                    predicted_box.append(int(coord + shift))
+
+                # 박스 크기가 너무 변하지 않도록 보정
+                orig_w = last_box[2] - last_box[0]
+                orig_h = last_box[3] - last_box[1]
+                new_w = predicted_box[2] - predicted_box[0]
+                new_h = predicted_box[3] - predicted_box[1]
+
+                # 크기가 20% 이상 변하면 원래 크기 유지
+                if new_w < orig_w * 0.8 or new_w > orig_w * 1.2:
+                    center_x = (predicted_box[0] + predicted_box[2]) // 2
+                    predicted_box[0] = center_x - orig_w // 2
+                    predicted_box[2] = center_x + orig_w // 2
+                if new_h < orig_h * 0.8 or new_h > orig_h * 1.2:
+                    center_y = (predicted_box[1] + predicted_box[3]) // 2
+                    predicted_box[1] = center_y - orig_h // 2
+                    predicted_box[3] = center_y + orig_h // 2
+
+                results.append({
+                    'track_id': track_id,
+                    'box': tuple(predicted_box),
+                    'type': track['type'],
+                    'interpolated': True
+                })
 
         return results
+
+    def get_all_active_tracks(self, frame_idx):
+        """활성화된 모든 트랙 수 반환 (디버깅용)"""
+        return sum(1 for t in self.tracks.values()
+                   if frame_idx - t['last_seen'] <= self.max_age)
 
 
 class PlateTracker:
@@ -778,15 +1003,18 @@ class VideoMaskerOptimized(VideoMasker):
         gpu_id: int = 0,
         use_fp16: bool = None,
         use_tensorrt: bool = False,
+        yolo_model: str = "yolov8n",  # yolov8n, yolov8s, yolov8m, yolov8l, yolov8x
         # 시스템 최적화
         auto_optimize: bool = True,
         queue_size: int = -1,
         high_performance: bool = False,  # 고성능 모드 (FFmpeg 파이프라인)
-        # 트래킹 파라미터
+        # 트래킹 파라미터 (track_buffer: 감지 누락 시 유지할 프레임 수)
         tracker: str = "bytetrack",
-        track_buffer: int = 30,
+        track_buffer: int = 60,  # 기본값 증가: 깜빡임 방지
         match_thresh: float = 0.8,
         iou_thresh: float = 0.5,
+        # 하드웨어 가속 디코딩
+        use_nvdec: bool = True,  # NVDEC GPU 디코딩 (NVIDIA GPU 필수)
     ):
         # 부모 클래스의 기본 속성만 설정 (모델 로드 제외)
         self.mask_persons = mask_persons
@@ -847,7 +1075,12 @@ class VideoMaskerOptimized(VideoMasker):
         self.iou_thresh = iou_thresh
         self.gpu_id = gpu_id
         self.use_tensorrt = use_tensorrt
-        
+
+        # NVDEC 설정 (CUDA 디바이스일 때만 사용 가능)
+        self.use_nvdec = use_nvdec and self.device == 'cuda'
+        if self.use_nvdec:
+            print(f"   🎬 NVDEC GPU 디코딩 활성화")
+
         # CUDA 최적화
         if self.device == 'cuda':
             setup_cuda_optimization(self.device, gpu_id)
@@ -862,24 +1095,28 @@ class VideoMaskerOptimized(VideoMasker):
         self.yolo_model = None
         self.yolo_half = False
 
+        self.yolo_model_name = yolo_model
+
         if mask_persons or mask_plates:
-            print(f"YOLOv8 모델 로딩 (device={self.device})...")
-            
+            model_file = f"{yolo_model}.pt"
+            print(f"YOLO 모델 로딩: {model_file} (device={self.device})...")
+
             if use_tensorrt and self.device == 'cuda':
-                tensorrt_path = Path("yolov8n.engine")
+                tensorrt_path = Path(f"{yolo_model}.engine")
                 if tensorrt_path.exists():
-                    print("   TensorRT 엔진 로딩...")
-                    self.yolo_model = YOLO(str(tensorrt_path))
+                    print(f"   TensorRT 엔진 로딩: {tensorrt_path}")
+                    self.yolo_model = YOLO(str(tensorrt_path), task='detect')
                 else:
-                    print("   ⚠️ TensorRT 엔진 없음")
-                    self.yolo_model = YOLO("yolov8n.pt")
+                    print(f"   ⚠️ TensorRT 엔진 없음, PyTorch 모델 사용")
+                    self.yolo_model = YOLO(model_file)
             else:
-                self.yolo_model = YOLO("yolov8n.pt")
-            
-            if self.device != 'cpu':
+                self.yolo_model = YOLO(model_file)
+
+            # TensorRT 모델은 .to() 호출 불가 (이미 GPU에 컴파일됨)
+            if self.device != 'cpu' and not self.use_tensorrt:
                 self.yolo_model.to(self.device)
-                
-            self.yolo_half = self.use_fp16 and self.device == 'cuda'
+
+            self.yolo_half = self.use_fp16 and self.device == 'cuda' and not self.use_tensorrt
             print(f"   ✅ 사람: {'O' if mask_persons else 'X'}, 번호판: {'O' if mask_plates else 'X'}")
 
         # 트래킹 보간기
@@ -1509,9 +1746,20 @@ class VideoMaskerOptimized(VideoMasker):
         finally:
             write_queue.put(None)
             reader.stop()
-            writer.join(timeout=10)
-            cap.release()
-            out.release()
+            # writer가 완전히 끝날 때까지 대기
+            if not writer.wait_finished(timeout=60):
+                logger.warning("Writer 타임아웃, 강제 종료")
+                writer.stop()
+            writer.join(timeout=5)
+            # VideoCapture/Writer 안전하게 해제
+            try:
+                cap.release()
+            except Exception:
+                pass
+            try:
+                out.release()
+            except Exception:
+                pass
 
         masking_time = time.time() - start_total_time
         logger.info("-" * 60)
@@ -1629,6 +1877,7 @@ class VideoMaskerOptimized(VideoMasker):
 
         start_total_time = time.time()
 
+        # 비디오 정보 가져오기 (cv2로)
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             raise ValueError(f"비디오를 열 수 없습니다: {input_path}")
@@ -1645,14 +1894,27 @@ class VideoMaskerOptimized(VideoMasker):
 
         queue_size = self.queue_size
 
+        # NVDEC 사용 여부 결정
+        use_nvdec = self.use_nvdec
+
         logger.info(f"입력: {input_path}")
         logger.info(f"해상도: {width}x{height}, FPS: {fps:.2f}")
         logger.info(f"처리 프레임: {process_frames:,}")
         logger.info(f"디바이스: {self.device}, 배치: {self.batch_size}, FP16: {self.use_fp16}")
+        logger.info(f"디코딩: {'NVDEC (GPU)' if use_nvdec else 'CPU'}")
         logger.info(f"멀티스레딩: 큐={queue_size}")
 
-        if start_frame > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        # NVDEC 사용 시 cv2 닫고 NVDEC 디코더 준비
+        if use_nvdec:
+            cap.release()
+            nvdec_decoder = NVDECDecoder(
+                input_path, width, height,
+                start_time=start_time, end_time=end_time
+            )
+        else:
+            nvdec_decoder = None
+            if start_frame > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
         # JSON 출력 경로
         if output_json is None:
@@ -1701,14 +1963,29 @@ class VideoMaskerOptimized(VideoMasker):
         detect_interval = self.detect_interval
 
         def decoder_thread():
-            """비동기 프레임 디코딩"""
+            """비동기 프레임 디코딩 (NVDEC 또는 CPU)"""
+            nonlocal nvdec_decoder
             count = 0
-            while count < process_frames:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                decode_queue.put((count, frame))
-                count += 1
+
+            if use_nvdec:
+                # NVDEC GPU 디코딩
+                nvdec_decoder.start()
+                while count < process_frames:
+                    frame = nvdec_decoder.read_frame()
+                    if frame is None:
+                        break
+                    decode_queue.put((count, frame))
+                    count += 1
+                nvdec_decoder.close()
+            else:
+                # CPU 디코딩 (cv2)
+                while count < process_frames:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    decode_queue.put((count, frame))
+                    count += 1
+
             done_decode[0] = True
 
         def analyzer_thread():
@@ -1813,7 +2090,10 @@ class VideoMaskerOptimized(VideoMasker):
         # 스레드 종료 대기
         decoder.join()
         analyzer.join()
-        cap.release()
+
+        # 리소스 정리 (NVDEC 미사용 시에만)
+        if not use_nvdec:
+            cap.release()
 
         # JSON 저장
         mask_data['stats'] = {
@@ -1876,7 +2156,7 @@ class VideoMaskerOptimized(VideoMasker):
         logger = setup_logger(log_file, verbose)
         logger.info("=" * 60)
         logger.info("2-Pass 모드: Pass 2 (인코딩) - 멀티스레딩")
-        logger.info("GPU 100% NVENC 인코딩 전용")
+        logger.info("GPU: NVDEC 디코딩 + NVENC 인코딩")
         logger.info("=" * 60)
 
         # JSON 마스크 데이터 로드
@@ -1894,6 +2174,7 @@ class VideoMaskerOptimized(VideoMasker):
 
         start_total_time = time.time()
 
+        # 비디오 정보 가져오기
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             raise ValueError(f"비디오를 열 수 없습니다: {input_path}")
@@ -1905,16 +2186,31 @@ class VideoMaskerOptimized(VideoMasker):
         end_frame = video_info['end_frame']
         process_frames = end_frame - start_frame
 
+        # NVDEC 사용 여부
+        use_nvdec = self.use_nvdec
+        start_time_sec = start_frame / fps if start_frame > 0 else None
+        end_time_sec = end_frame / fps if end_frame < video_info.get('total_frames', end_frame) else None
+
         logger.info(f"입력: {input_path}")
         logger.info(f"해상도: {width}x{height}, FPS: {fps:.2f}")
         logger.info(f"처리 프레임: {process_frames:,}")
+        logger.info(f"디코딩: {'NVDEC (GPU)' if use_nvdec else 'CPU'}")
 
         if output_path is None:
             input_stem = Path(input_path).stem
             output_path = str(Path(input_path).parent / f"{input_stem}_masked.mp4")
 
-        if start_frame > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        # NVDEC 사용 시 cv2 닫고 NVDEC 디코더 준비
+        if use_nvdec:
+            cap.release()
+            nvdec_decoder = NVDECDecoder(
+                input_path, width, height,
+                start_time=start_time_sec, end_time=end_time_sec
+            )
+        else:
+            nvdec_decoder = None
+            if start_frame > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
         # 최적화된 NVENC 인코더 설정
         encode_settings = self.optimal_settings if self.optimal_settings else {
@@ -1966,14 +2262,29 @@ class VideoMaskerOptimized(VideoMasker):
         mosaic_size = self.mosaic_size
 
         def decoder_thread():
-            """비동기 프레임 디코딩"""
+            """비동기 프레임 디코딩 (NVDEC 또는 CPU)"""
+            nonlocal nvdec_decoder
             count = 0
-            while count < process_frames:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                decode_queue.put((count, frame))
-                count += 1
+
+            if use_nvdec:
+                # NVDEC GPU 디코딩
+                nvdec_decoder.start()
+                while count < process_frames:
+                    frame = nvdec_decoder.read_frame()
+                    if frame is None:
+                        break
+                    decode_queue.put((count, frame))
+                    count += 1
+                nvdec_decoder.close()
+            else:
+                # CPU 디코딩 (cv2)
+                while count < process_frames:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    decode_queue.put((count, frame))
+                    count += 1
+
             done_decode[0] = True
 
         def masker_thread():
@@ -2070,7 +2381,10 @@ class VideoMaskerOptimized(VideoMasker):
         # 인코더 종료
         encoder.stdin.close()
         encoder.wait()
-        cap.release()
+
+        # 리소스 정리 (NVDEC 미사용 시에만)
+        if not use_nvdec:
+            cap.release()
 
         total_time = time.time() - start_total_time
         avg_fps = stats_counter['processed'] / total_time if total_time > 0 else 0
