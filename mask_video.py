@@ -129,6 +129,8 @@ def main():
                        help="감지용 다운스케일 (-1=자동)")
     parser.add_argument("--batch-size", type=int, default=-1,
                        help="배치 크기 (-1=자동)")
+    parser.add_argument("--queue-size", type=int, default=-1,
+                       help="프레임 큐 크기 (-1=자동, 병렬처리 시 64 권장)")
     parser.add_argument("--high-performance", action="store_true",
                        help="고성능 모드: FFmpeg 파이프라인 + 진정한 배치 추론 (CUDA 필수)")
     parser.add_argument("--fp16", action="store_true",
@@ -221,6 +223,7 @@ def main():
             detect_interval=args.detect_interval,
             detect_scale=args.detect_scale,
             batch_size=args.batch_size,
+            queue_size=args.queue_size,
             high_performance=args.high_performance,
             use_fp16=args.fp16 if args.fp16 else None,
             use_tensorrt=args.tensorrt and not args.no_tensorrt,

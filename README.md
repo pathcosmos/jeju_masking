@@ -155,6 +155,7 @@ python mask_video.py input.mp4
 | `--detect-interval` | 감지 수행 프레임 간격 (1=매 프레임, -1=자동) | `-1` |
 | `--detect-scale` | 감지용 해상도 스케일 (0.5 = 50%, -1=자동) | `-1` |
 | `--batch-size` | 배치 추론 크기 (-1=자동) | `-1` |
+| `--queue-size` | 프레임 큐 크기 (-1=자동, 병렬처리 시 64 권장) | `-1` |
 | `--high-performance` | 고성능 모드: FFmpeg 파이프라인 + 배치 GPU 추론 | 비활성화 |
 | `--no-auto` | 자동 최적화 비활성화 | - |
 
@@ -293,6 +294,42 @@ tail -f masking.log
 | **yolo11x** | ✅ | 매우 높음 | ~33 fps | 대안 |
 | **yolov8x** | ✅ | 높음 | ~35 fps | 속도 중시 |
 | **yolov8n** | ✅ | 낮음 | ~45 fps | 테스트용 |
+
+### 병렬 처리 (여러 영상 동시 처리)
+
+여러 영상을 동시에 처리하여 총 처리량을 높일 수 있습니다.
+
+#### 병렬 처리 설정
+
+| 설정 | RAM 사용 | 개별 속도 | 총 처리량 | 권장 |
+|------|----------|-----------|-----------|------|
+| 단일 (기본) | ~10GB | 28 fps | 28 fps | 일반 |
+| **3개 병렬** (`--queue-size 64`) | ~23GB | 19-23 fps | **~63 fps** | **권장** |
+
+#### 병렬 처리 사용법
+
+```bash
+# 3개 영상 동시 처리 (--queue-size 64 필수!)
+python mask_video.py video1.mp4 --queue-size 64 --hevc -o out1.mp4 &
+python mask_video.py video2.mp4 --queue-size 64 --hevc -o out2.mp4 &
+python mask_video.py video3.mp4 --queue-size 64 --hevc -o out3.mp4 &
+wait  # 모든 프로세스 완료 대기
+```
+
+#### 병렬 처리 핵심 포인트
+
+- **`--queue-size 64` 필수**: 기본값(512)은 프레임 버퍼가 커서 RAM 부족 발생
+- **RAM 32GB 기준 최대 3개**: 프로세스당 ~8GB RAM 사용
+- **총 처리량 2배 이상**: 단일 28fps → 병렬 63fps (2.25배)
+- **GPU/VRAM 여유**: GPU 17%, VRAM 4.5GB/12GB (병목 아님)
+
+#### 권장 병렬 수 (RAM 기준)
+
+| 시스템 RAM | 권장 병렬 수 | `--queue-size` |
+|-----------|-------------|----------------|
+| 16GB | 1개 | 기본값 |
+| 32GB | **3개** | 64 |
+| 64GB | 5-6개 | 64 |
 
 ### 2-Pass 모드 상세
 
@@ -438,10 +475,15 @@ yolo export model=yolo12x.pt format=engine half=True device=0
   - `wait_finished()` 메서드로 안전한 종료 보장
   - VideoCapture/Writer 안전한 해제
 
+**병렬 처리 지원**
+- **`--queue-size` 옵션 추가**: 프레임 큐 크기 조절로 RAM 최적화
+- **3개 동시 처리 가능**: `--queue-size 64`로 RAM 사용량 감소
+- **총 처리량 2.25배 향상**: 단일 28fps → 병렬 63fps
+
 **성능 (RTX 4070 SUPER, 4K 60fps)**
-- yolo12x TensorRT: ~32 fps
-- yolo11x TensorRT: ~33 fps
-- 1분 영상 (3596 프레임) 처리: 2.8분 (인코딩 포함)
+- 단일 처리: yolo12x TensorRT ~32 fps
+- **병렬 처리 (3개)**: 총 ~63 fps (개별 19-23 fps)
+- 15분 영상: 41.5분 (단일) → ~18분 (병렬 3개 추정)
 
 ### v3.1 - 2026-01-04
 
