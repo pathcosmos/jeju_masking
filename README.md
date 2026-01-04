@@ -19,11 +19,14 @@ NVIDIA CUDA / Apple Silicon MPS GPU 가속, 멀티스레딩, 트래킹 보간 �
 
 ```
 jeju_masking/
-├── mask_video_optimized.py  # 최적화 버전 (권장)
-├── mask_video_advanced.py   # 기본 버전
-├── mask_video.py            # 초기 버전
-├── models/                  # 얼굴 감지 모델 (자동 다운로드)
-├── mov/                     # 입출력 영상 폴더
+├── mask_video.py            # CLI 인터페이스 (권장 진입점)
+├── video_masker.py          # 핵심 마스킹 클래스 (VideoMasker, VideoMaskerOptimized)
+├── masking_utils.py         # 공용 유틸리티 (로거, 시간 파싱 등)
+├── encoding_utils.py        # 인코딩 유틸리티 (NVENC 설정, 시스템 최적화)
+├── two_pass.py              # 2-Pass 모드 함수
+├── high_performance.py      # 고성능 모드 함수
+├── models/                  # 감지 모델 (자동 다운로드)
+├── movs/                    # 입출력 영상 폴더
 ├── SETUP.md                 # 환경 설정 가이드
 └── README.md                # 이 파일
 ```
@@ -82,8 +85,17 @@ pip로 설치되는 opencv-python 패키지는 CUDA 지원이 포함되어 있�
 
 ```bash
 source .venv/bin/activate
-python mask_video_optimized.py input.mp4
+python mask_video.py input.mp4
 ```
+
+### 처리 모드 선택
+
+| 모드 | 옵션 | 특징 | 권장 사용 |
+|------|------|------|-----------|
+| **최적화 모드** | (기본) | 1-Pass, 멀티스레딩 파이프라인 | 일반 처리 |
+| **고성능 모드** | `--high-performance` | 1-Pass, 배치 GPU 추론 + NVENC | RTX GPU 최대 활용 |
+| **2-Pass 모드** | `--2pass` | Pass1(분석) + Pass2(인코딩) 분리 | JSON 재작업, 대용량 처리 |
+| **간단 모드** | `--simple` | 최적화 없음, 기본 설정 | CPU 환경, 빠른 테스트 |
 
 ### 옵션 전체 목록
 
@@ -116,14 +128,28 @@ python mask_video_optimized.py input.mp4
 | `--face-expand` | 얼굴 영역 확장 비율 | `0.2` |
 | `--plate-expand` | 번호판 영역 확장 비율 | `0.3` |
 
+#### 2-Pass 모드 옵션
+
+| 옵션 | 설명 | 기본값 |
+|------|------|--------|
+| `--2pass` | 2-Pass 모드 활성화 (분석→인코딩 분리) | 비활성화 |
+| `--analyze-only` | Pass 1만 실행: 마스크 좌표를 JSON으로 저장 | - |
+| `--encode-only` | Pass 2만 실행: JSON 마스크 데이터로 인코딩 | - |
+| `--mask-json` | 마스크 JSON 파일 경로 (`--encode-only`와 함께) | - |
+| `--keep-json` | 2-Pass 완료 후 JSON 파일 유지 | 삭제 |
+
 #### 성능 최적화 옵션
 
 | 옵션 | 설명 | 기본값 |
 |------|------|--------|
 | `--device` | 연산 디바이스 (`auto`, `mps`, `cuda`, `cpu`) | `auto` |
-| `--detect-interval` | 감지 수행 프레임 간격 (1=매 프레임) | `3` |
-| `--detect-scale` | 감지용 해상도 스케일 (0.5 = 50%) | `0.5` |
-| `--batch-size` | 배치 추론 크기 | `4` |
+| `--detect-interval` | 감지 수행 프레임 간격 (1=매 프레임, -1=자동) | `-1` |
+| `--detect-scale` | 감지용 해상도 스케일 (0.5 = 50%, -1=자동) | `-1` |
+| `--batch-size` | 배치 추론 크기 (-1=자동) | `-1` |
+| `--high-performance` | 고성능 모드: FFmpeg 파이프라인 + 배치 GPU 추론 | 비활성화 |
+| `--fp16` | FP16 반정밀도 추론 (NVIDIA GPU 전용) | 비활성화 |
+| `--tensorrt` | TensorRT 가속 | 비활성화 |
+| `--no-auto` | 자동 최적화 비활성화 | - |
 
 #### 트래킹 파라미터
 
@@ -148,64 +174,86 @@ python mask_video_optimized.py input.mp4
 ### 기본 마스킹
 
 ```bash
-# 전체 영상 마스킹 (얼굴 + 번호판 블러)
-python mask_video_optimized.py video.mp4
+# 전체 영상 마스킹 (사람 + 번호판 블러)
+python mask_video.py video.mp4
+
+# 특정 구간만 처리 (23분~28분)
+python mask_video.py video.mp4 --start 23:00 --end 28:00
+
+# HEVC 인코딩 (RTX GPU에서 NVENC 자동 사용)
+python mask_video.py video.mp4 --hevc
 ```
 
-### 구간 지정
+### 고성능 모드 (RTX GPU 권장)
 
 ```bash
-# 23분~28분 구간만 처리
-python mask_video_optimized.py video.mp4 --start 23:00 --end 28:00
+# 1-Pass 고성능 모드: 배치 GPU 추론 + NVENC 인코딩
+# RTX 4070 SUPER 기준 4K 60fps에서 ~48 fps 달성
+python mask_video.py video.mp4 --high-performance --hevc
+
+# FP16 반정밀도 추론 (메모리 절약, 속도 향상)
+python mask_video.py video.mp4 --high-performance --fp16 --hevc
 ```
 
-### HEVC 출력
+### 2-Pass 모드 (GPU 최대 활용, 재작업 가능)
 
 ```bash
-# HEVC 인코딩으로 파일 크기 감소
-python mask_video_optimized.py video.mp4 --hevc
+# 2-Pass 모드: Pass1(분석) → Pass2(인코딩) 순차 실행
+python mask_video.py video.mp4 --2pass --hevc
+
+# JSON 파일 유지 (재인코딩 가능)
+python mask_video.py video.mp4 --2pass --hevc --keep-json
 ```
 
-### 모자이크 처리
+### 2-Pass 분리 실행 (일괄 처리)
 
 ```bash
-# 블러 대신 모자이크
-python mask_video_optimized.py video.mp4 --mask-type mosaic --mosaic-size 20
+# 여러 영상을 분석만 먼저 실행 (GPU 100% YOLO 추론)
+python mask_video.py video1.mp4 --analyze-only
+python mask_video.py video2.mp4 --analyze-only
+python mask_video.py video3.mp4 --analyze-only
+
+# 분석 완료 후 순차 인코딩 (GPU 100% NVENC)
+python mask_video.py video1.mp4 --encode-only --mask-json video1_masks.json --hevc
+python mask_video.py video2.mp4 --encode-only --mask-json video2_masks.json --hevc
+python mask_video.py video3.mp4 --encode-only --mask-json video3_masks.json --hevc
 ```
 
-### 번호판만 처리
+### 번호판/사람 선택 마스킹
 
 ```bash
-# 얼굴 마스킹 비활성화 (번호판만)
-python mask_video_optimized.py video.mp4 --no-faces
+# 번호판만 마스킹 (사람 제외)
+python mask_video.py video.mp4 --no-persons
+
+# 사람만 마스킹 (번호판 제외)
+python mask_video.py video.mp4 --no-plates
+
+# 모자이크 처리
+python mask_video.py video.mp4 --mask-type mosaic --mosaic-size 20
 ```
 
-### 고성능 설정
+### 정확도 vs 속도 조절
 
 ```bash
-# 매 프레임 감지 + 원본 해상도 감지 (정확도 최대, 속도 느림)
-python mask_video_optimized.py video.mp4 --detect-interval 1 --detect-scale 1.0
-```
+# 매 프레임 감지 (정확도 최대, 속도 느림)
+python mask_video.py video.mp4 --detect-interval 1
 
-### 빠른 처리 설정
-
-```bash
-# 5프레임마다 감지 + 25% 해상도 (속도 최대, 정확도 감소)
-python mask_video_optimized.py video.mp4 --detect-interval 5 --detect-scale 0.25
+# 5프레임마다 감지 (속도 최대, 정확도 감소)
+python mask_video.py video.mp4 --detect-interval 5 --detect-scale 0.25
 ```
 
 ### 트래킹 조정
 
 ```bash
 # 긴 트래킹 버퍼 (객체가 일시적으로 사라져도 추적 유지)
-python mask_video_optimized.py video.mp4 --track-buffer 60 --match-thresh 0.7
+python mask_video.py video.mp4 --track-buffer 60
 ```
 
 ### 실시간 로그 모니터링
 
 ```bash
 # 상세 로그 + 파일 저장
-python mask_video_optimized.py video.mp4 -v --log masking.log
+python mask_video.py video.mp4 -v --log masking.log
 
 # 별도 터미널에서 실시간 확인
 tail -f masking.log
@@ -217,22 +265,108 @@ tail -f masking.log
 
 ### 테스트 환경
 
-- **장비**: Apple M 시리즈 (Apple Silicon)
+- **GPU**: NVIDIA RTX 4070 SUPER (12GB VRAM)
+- **CPU**: Intel i5-13400 (10코어, 16스레드)
+- **RAM**: 32GB DDR5
 - **입력**: 4K 60fps 영상 (3840x2160)
-- **설정**: 기본값 (detect-interval=3, detect-scale=0.5)
 
-### 처리 속도
+### 처리 모드별 성능 비교
 
-| 영상 길이 | 처리 시간 | 평균 fps | 실시간 대비 |
-|-----------|-----------|----------|-------------|
-| 1분 | ~2분 | ~30 fps | 0.5x |
-| 15분 | ~31분 | ~29 fps | 0.49x |
+| 모드 | 속도 (fps) | 특징 | 권장 사용 |
+|------|------------|------|-----------|
+| **고성능 모드** (`--high-performance`) | ~48 fps | 1-Pass, GPU 추론+인코딩 동시 | 빠른 처리 |
+| **2-Pass 모드** (`--2pass`) | ~22 fps (분석) + ~20 fps (인코딩) | 2-Pass, JSON 저장 | 재작업 필요 시 |
+| **최적화 모드** (기본) | ~30 fps | 1-Pass, 안정적 | 일반 사용 |
 
-### 감지 통계 예시 (15분 4K 영상)
+### 2-Pass 모드 상세
 
-- 처리 프레임: 53,975
-- 감지된 얼굴: 2,925
-- 감지된 차량: 126,342
+| Pass | 동작 | GPU 사용 | 출력 |
+|------|------|----------|------|
+| **Pass 1** (분석) | YOLO 배치 추론 | GPU 100% 추론 | JSON 마스크 파일 |
+| **Pass 2** (인코딩) | 마스크 적용 + NVENC | GPU 100% 인코딩 | 마스킹된 영상 |
+
+### NVENC 인코딩 최적화
+
+시스템 사양에 따라 자동으로 최적화된 NVENC 설정이 적용됩니다:
+
+| 항목 | RTX 4070 SUPER (12GB) | RTX 3060 (8GB) | GTX 1660 (6GB) |
+|------|----------------------|----------------|----------------|
+| 프리셋 | p4 (quality) | p3 (balanced) | p2 (fast) |
+| Lookahead | 32 프레임 | 24 프레임 | 16 프레임 |
+| B-프레임 | 4 | 3 | 2 |
+| Surfaces | 16 | 12 | 8 |
+| FP16 추론 | 활성화 | 활성화 | 비활성화 |
+
+### 감지 통계 예시 (1분 4K 영상)
+
+- 처리 프레임: 3,596
+- 감지된 사람: 0
+- 감지된 번호판: 19,021
+
+---
+
+## 2-Pass 모드 상세
+
+### 작동 원리
+
+2-Pass 모드는 GPU 자원을 최대한 활용하기 위해 분석과 인코딩을 분리합니다:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Pass 1: 분석 (GPU 100% YOLO 추론)                            │
+│                                                             │
+│   비디오 → [디코더] → [YOLO 배치 추론] → JSON 마스크 파일     │
+│                     (사람/번호판 감지)                        │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Pass 2: 인코딩 (GPU 100% NVENC)                              │
+│                                                             │
+│   비디오 + JSON → [마스크 적용] → [NVENC 인코딩] → 출력 영상  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### JSON 마스크 형식
+
+```json
+{
+  "metadata": {
+    "version": "1.0",
+    "input": "video.mp4",
+    "width": 3840,
+    "height": 2160,
+    "fps": 59.94,
+    "total_frames": 3596,
+    "start_frame": 0,
+    "end_frame": 3596,
+    "created": "2026-01-04T12:51:53"
+  },
+  "stats": {
+    "total_persons": 0,
+    "total_plates": 19021
+  },
+  "frames": {
+    "0": {
+      "persons": [],
+      "plates": [[1520, 1080, 1680, 1140]]
+    },
+    "1": {
+      "persons": [],
+      "plates": [[1522, 1082, 1682, 1142], [2100, 1500, 2200, 1550]]
+    }
+  }
+}
+```
+
+### 사용 시나리오
+
+| 시나리오 | 명령어 | 설명 |
+|----------|--------|------|
+| 일반 처리 | `--2pass` | Pass1 + Pass2 순차 실행, JSON 자동 삭제 |
+| 재작업 대비 | `--2pass --keep-json` | JSON 파일 유지 |
+| 일괄 분석 | `--analyze-only` | 여러 영상 분석만 먼저 실행 |
+| 일괄 인코딩 | `--encode-only --mask-json file.json` | 분석된 영상 순차 인코딩 |
+| 파라미터 변경 | `--encode-only --mask-json file.json --mask-type mosaic` | 동일 분석 결과로 다른 마스킹 |
 
 ---
 
@@ -249,7 +383,57 @@ tail -f masking.log
 
 ## 변경 이력
 
-### v2.4.1 - 2026-01-03 (현재)
+### v3.1 - 2026-01-04 (현재)
+
+**코드 모듈화**
+- **파일 분리**: 대규모 단일 파일을 기능별 모듈로 분리
+  - `encoding_utils.py`: 시스템 정보 수집, NVENC 설정, FFmpeg 명령어 빌더
+  - `two_pass.py`: 2-Pass 모드 함수 (`analyze_video`, `encode_with_masks`, `process_video_2pass`)
+  - `high_performance.py`: 고성능 모드 함수 (`process_video_high_performance`)
+  - `masking_utils.py`: 공용 유틸리티 (로거 설정, 시간 파싱)
+- **CLI 통합**: `mask_video.py`를 단일 진입점으로 통합
+  - 기존 `mask_video_optimized.py`, `mask_video_advanced.py` 기능 포함
+
+**2-Pass 멀티스레딩**
+- **Pass 1 멀티스레딩**: `decoder_thread` + `analyzer_thread` 비동기 처리
+- **Pass 2 멀티스레딩**: `decoder_thread` + `masker_thread` + `encoder_thread` 파이프라인
+- **성능 개선**: 2-Pass 총 시간 6.7분 → 5.5분 (18% 향상)
+
+### v3.0 - 2026-01-04
+
+**NVENC 인코딩 최적화**
+- **최적화된 NVENC 설정**: `build_nvenc_command()` 함수 추가
+  - `rc-lookahead`: 프레임 미리보기로 품질 향상 (최대 32프레임)
+  - `spatial-aq`: 공간 적응형 양자화 (디테일 보존)
+  - `temporal-aq`: 시간 적응형 양자화 (움직임 품질)
+  - `surfaces`: 동시 인코딩 표면 (처리량 증가)
+  - `b_ref_mode`: B-프레임 참조 (압축 효율)
+- **시스템 자동 최적화**: `get_optimal_settings()` 함수 개선
+  - CPU 코어/스레드 기반 FFmpeg 스레드 수 자동 설정
+  - RAM 용량 기반 큐 크기 자동 조정
+  - VRAM 용량 기반 배치 크기 자동 계산
+  - GPU 아키텍처 기반 FP16/프리셋 자동 선택
+
+**2-Pass 모드 추가**
+- **Pass 1 (분석)**: GPU 100% YOLO 추론, 마스크 좌표를 JSON으로 저장
+  - 프레임별 마스크 바운딩 박스 저장
+  - 사람/번호판 감지 통계 포함
+  - 메타데이터 (해상도, FPS, 총 프레임 수) 저장
+- **Pass 2 (인코딩)**: GPU 100% NVENC 인코딩, JSON 마스크 적용
+  - JSON 마스크 데이터 로드
+  - 프레임별 마스크 적용 + NVENC 하드웨어 인코딩
+- **분리 실행 지원**: `--analyze-only`, `--encode-only`, `--mask-json` 옵션
+  - 여러 영상 일괄 분석 후 순차 인코딩 가능
+  - JSON 파일 유지로 재인코딩 지원 (`--keep-json`)
+
+**고성능 모드 개선**
+- **멀티스레딩 파이프라인**: 디코딩, 추론, 인코딩 비동기 처리
+  - `decoder_thread`: 비동기 프레임 읽기
+  - `processor_thread`: 배치 GPU 추론 + 마스킹
+  - `encoder_thread`: NVENC 순서 보장 인코딩
+- **RTX 4070 SUPER 기준**: 4K 60fps에서 ~48 fps 달성
+
+### v2.4.1 - 2026-01-03
 
 **버그 수정**
 - **FP16 추론 오류 수정**: `yolo_half` 변수 초기화 시 잘못된 변수 참조 수정
