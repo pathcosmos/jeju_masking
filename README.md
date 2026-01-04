@@ -851,6 +851,70 @@ python mask_video_optimized.py video.mp4 --track-buffer 60 --match-thresh 0.6
 python mask_video_optimized.py video.mp4 --detect-interval 5 --detect-scale 0.25
 ```
 
+### NVENC/NVDEC 하드웨어 가속 실패
+
+NVIDIA 하드웨어 인코더/디코더는 **지원하는 픽셀 포맷이 제한적**입니다.
+
+#### 지원 포맷
+
+| 포맷 | NVDEC | NVENC | 비고 |
+|------|-------|-------|------|
+| **8bit 4:2:0** (yuv420p) | ✅ | ✅ | 가장 호환성 좋음 |
+| **10bit 4:2:0** (p010le) | ✅ | ✅ | HDR/고품질 권장 |
+| 8bit 4:2:2 (yuv422p) | ❌ | ❌ | 미지원 |
+| **10bit 4:2:2** (yuv422p10le) | ❌ | ❌ | 미지원 |
+| 8bit 4:4:4 (yuv444p) | ❌ | ⚠️ | 일부 GPU만 지원 |
+
+#### 증상
+
+```
+[hevc_nvenc @ 0x...] No capable devices found
+```
+또는
+```
+Error initializing output stream -- Hardware does not support this format
+```
+
+#### 해결: 입력 영상을 4:2:0으로 변환
+
+```bash
+# 10bit 4:2:2 → 10bit 4:2:0 변환 (NVENC 사용)
+ffmpeg -i input_422.mp4 -c:v hevc_nvenc -preset p4 -pix_fmt p010le -c:a copy output_420.mp4
+
+# 소프트웨어 인코더로 변환 (더 호환성 높음)
+ffmpeg -i input_422.mp4 -c:v libx265 -pix_fmt yuv420p10le -crf 18 -c:a copy output_420.mp4
+
+# 8bit로 변환 (파일 크기 작음)
+ffmpeg -i input_422.mp4 -c:v hevc_nvenc -preset p4 -pix_fmt yuv420p -c:a copy output_420_8bit.mp4
+```
+
+#### 입력 영상 포맷 확인
+
+```bash
+# 픽셀 포맷 확인
+ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=nw=1 input.mp4
+
+# 상세 정보 확인
+ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,pix_fmt,color_space,color_transfer -of default=nw=1 input.mp4
+```
+
+#### 일괄 변환 스크립트
+
+```bash
+#!/bin/bash
+# convert_to_420.sh - 4:2:2 영상을 4:2:0으로 일괄 변환
+
+for f in *.mp4; do
+  pix_fmt=$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$f")
+  if [[ "$pix_fmt" == *"422"* ]]; then
+    echo "Converting $f ($pix_fmt → p010le)"
+    ffmpeg -y -i "$f" -c:v hevc_nvenc -preset p4 -pix_fmt p010le -c:a copy "${f%.mp4}_420.mp4"
+  fi
+done
+```
+
+> 💡 **팁**: 원본이 10bit 4:2:2인 경우, 10bit 4:2:0 (p010le)으로 변환하면 색상 정보 손실을 최소화할 수 있습니다.
+
 ---
 
 ## TODO (개선 필요 사항)
