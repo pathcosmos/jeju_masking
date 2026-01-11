@@ -24,7 +24,8 @@ from ultralytics import YOLO
 from masking_utils import (
     setup_logger, apply_blur, apply_mosaic,
     expand_box, get_plate_region, get_all_plate_regions,
-    validate_box, validate_and_clip_box
+    validate_box, validate_and_clip_box,
+    is_front_or_rear_view, get_vehicle_lower_region, get_plate_region_by_view
 )
 from encoding_utils import (
     get_system_info, get_optimal_settings, build_nvenc_command, print_system_info
@@ -825,11 +826,21 @@ class VideoMasker:
                         # 기존 방식: 하단 영역만
                         px1, py1, px2, py2 = get_plate_region(xyxy, self.plate_expand)
                         frame, _ = self.safe_apply_mask(frame, px1, py1, px2, py2, max_ratio=0.15)
+                    elif self.plate_detect_mode == "lower_body":
+                        # v3.4 신규: 앞/뒷면 차량만 하단 전체 마스킹
+                        plate_regions = get_plate_region_by_view(
+                            frame, xyxy, frame.shape,
+                            aspect_threshold=1.4,
+                            upper_ratio=0.35,
+                            expand_ratio=self.plate_expand
+                        )
+                        for px1, py1, px2, py2 in plate_regions:
+                            frame, _ = self.safe_apply_mask(frame, px1, py1, px2, py2, max_ratio=0.25)
                     else:
                         # 개선된 방식: OpenCV 감지 또는 다중 위치
                         use_detection = (self.plate_detect_mode == "auto")
                         plate_regions = get_all_plate_regions(
-                            frame, xyxy, 
+                            frame, xyxy,
                             expand_ratio=self.plate_expand,
                             use_detection=use_detection
                         )
@@ -858,7 +869,11 @@ class VideoMasker:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             log_file = str(Path(input_path).parent / f"masking_{timestamp}.log")
 
-        logger = setup_logger(log_file, verbose)
+        # 입력 파일명에서 prefix 추출
+        input_stem = Path(input_path).stem
+        log_prefix = input_stem.split('_')[0] if '_' in input_stem else input_stem
+
+        logger = setup_logger(log_file, verbose, prefix=log_prefix)
         logger.info("=" * 60)
         logger.info("마스킹 작업 시작 (기본 모드)")
         logger.info("=" * 60)
@@ -1362,15 +1377,25 @@ class VideoMaskerOptimized(VideoMasker):
             for vehicle in vehicles:
                 track_id = vehicle.get('track_id')
                 vehicle_box = vehicle['box']
-                
+
                 if self.plate_detect_mode == "legacy":
                     # 기존 방식: 하단 영역만 (트래킹 없음)
                     plate_box = get_plate_region(vehicle_box, self.plate_expand)
                     frame, _ = self.safe_apply_mask(frame, *plate_box, max_ratio=0.15)
+                elif self.plate_detect_mode == "lower_body":
+                    # v3.4 신규: 앞/뒷면 차량만 하단 전체 마스킹 (안정적)
+                    plate_regions = get_plate_region_by_view(
+                        frame, vehicle_box, frame.shape,
+                        aspect_threshold=1.4,
+                        upper_ratio=0.35,
+                        expand_ratio=self.plate_expand
+                    )
+                    for plate_box in plate_regions:
+                        frame, _ = self.safe_apply_mask(frame, *plate_box, max_ratio=0.25)
                 else:
                     # 개선된 방식: 번호판 트래킹 + 보간
                     plate_regions = []
-                    
+
                     # 감지가 필요한 프레임에서만 새로 감지
                     if should_detect or not vehicle.get('interpolated', False):
                         use_detection = (self.plate_detect_mode == "auto")
@@ -1379,13 +1404,13 @@ class VideoMaskerOptimized(VideoMasker):
                             expand_ratio=self.plate_expand,
                             use_detection=use_detection
                         )
-                        
+
                         # 번호판 트래커 업데이트
                         self.plate_tracker.update(frame_idx, track_id, detected_plates)
-                    
+
                     # 캐시된 번호판 위치 사용 (부드러운 보간)
                     plate_regions = self.plate_tracker.get_plates(frame_idx, track_id, vehicle_box)
-                    
+
                     # 캐시가 없으면 현재 감지 결과 사용
                     if not plate_regions:
                         use_detection = (self.plate_detect_mode == "auto")
@@ -1394,7 +1419,7 @@ class VideoMaskerOptimized(VideoMasker):
                             expand_ratio=self.plate_expand,
                             use_detection=use_detection
                         )
-                    
+
                     for plate_box in plate_regions:
                         # 번호판은 프레임의 15% 이하여야 함
                         frame, _ = self.safe_apply_mask(frame, *plate_box, max_ratio=0.15)
@@ -1624,7 +1649,11 @@ class VideoMaskerOptimized(VideoMasker):
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             log_file = str(Path(input_path).parent / f"masking_{timestamp}.log")
 
-        logger = setup_logger(log_file, verbose)
+        # 입력 파일명에서 prefix 추출 (예: 01-111_4k_420_10bit.mp4 -> 01-111)
+        input_stem = Path(input_path).stem
+        log_prefix = input_stem.split('_')[0] if '_' in input_stem else input_stem
+
+        logger = setup_logger(log_file, verbose, prefix=log_prefix)
         logger.info("=" * 60)
         logger.info("최적화 마스킹 v3.0 시작")
         logger.info("=" * 60)
@@ -1869,7 +1898,11 @@ class VideoMaskerOptimized(VideoMasker):
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             log_file = str(Path(input_path).parent / f"analyze_{timestamp}.log")
 
-        logger = setup_logger(log_file, verbose)
+        # 입력 파일명에서 prefix 추출
+        input_stem = Path(input_path).stem
+        log_prefix = input_stem.split('_')[0] if '_' in input_stem else input_stem
+
+        logger = setup_logger(log_file, verbose, prefix=log_prefix)
         logger.info("=" * 60)
         logger.info("2-Pass 모드: Pass 1 (분석) - 멀티스레딩")
         logger.info("GPU 100% YOLO 추론 전용")
@@ -2153,7 +2186,11 @@ class VideoMaskerOptimized(VideoMasker):
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             log_file = str(Path(input_path).parent / f"encode_{timestamp}.log")
 
-        logger = setup_logger(log_file, verbose)
+        # 입력 파일명에서 prefix 추출
+        input_stem = Path(input_path).stem
+        log_prefix = input_stem.split('_')[0] if '_' in input_stem else input_stem
+
+        logger = setup_logger(log_file, verbose, prefix=log_prefix)
         logger.info("=" * 60)
         logger.info("2-Pass 모드: Pass 2 (인코딩) - 멀티스레딩")
         logger.info("GPU: NVDEC 디코딩 + NVENC 인코딩")

@@ -112,8 +112,8 @@ def main():
     parser.add_argument("--plate-expand", type=float, default=0.5,
                        help="번호판 영역 확장 비율 (기본: 0.5, 여유있게 마스킹)")
     parser.add_argument("--plate-detect", type=str, default="auto",
-                       choices=["auto", "multi", "legacy"],
-                       help="번호판 감지 모드: auto=OpenCV 자동감지, multi=다중위치, legacy=하단만 (기본: auto)")
+                       choices=["auto", "multi", "legacy", "lower_body"],
+                       help="번호판 감지 모드: auto=OpenCV 자동감지, multi=다중위치, legacy=하단만, lower_body=앞뒤 하단전체 (기본: auto)")
     parser.add_argument("--plate-smoothing", type=float, default=0.6,
                        help="번호판 위치 스무딩 (0~1, 높을수록 안정적, 기본: 0.6)")
     parser.add_argument("--max-mask-ratio", type=float, default=0.4,

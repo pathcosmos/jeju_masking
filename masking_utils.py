@@ -20,9 +20,19 @@ class FlushStreamHandler(logging.StreamHandler):
         self.flush()
 
 
-def setup_logger(log_file=None, verbose=False, name=__name__):
-    """로거 설정 (실시간 출력)"""
-    log_format = '%(asctime)s [%(levelname)s] %(message)s'
+def setup_logger(log_file=None, verbose=False, name=__name__, prefix=None):
+    """로거 설정 (실시간 출력)
+
+    Args:
+        log_file: 로그 파일 경로
+        verbose: 상세 로그 여부
+        name: 로거 이름
+        prefix: 로그 메시지 앞에 붙을 식별자 (예: '[01-111]')
+    """
+    if prefix:
+        log_format = f'%(asctime)s [%(levelname)s] [{prefix}] %(message)s'
+    else:
+        log_format = '%(asctime)s [%(levelname)s] %(message)s'
     date_format = '%Y-%m-%d %H:%M:%S'
 
     console_handler = FlushStreamHandler(sys.stdout)
@@ -475,4 +485,190 @@ def interpolate_box(box1, box2, alpha):
     if box2 is None:
         return box1
     return tuple(int(b1 * (1 - alpha) + b2 * alpha) for b1, b2 in zip(box1[:4], box2[:4]))
+
+
+# ============================================================
+# 차량 앞/뒷면 판별 및 하단 마스킹 (v3.4)
+# ============================================================
+
+def is_front_or_rear_view(vehicle_box, aspect_threshold=1.4):
+    """
+    차량이 앞면/뒷면인지 종횡비로 판별
+
+    앞/뒷면: 정사각형에 가까움 (종횡비 < threshold)
+    측면: 가로로 긺 (종횡비 >= threshold)
+
+    Args:
+        vehicle_box: (x1, y1, x2, y2) 차량 bbox
+        aspect_threshold: 앞/뒷면 판별 임계값 (기본 1.4)
+
+    Returns:
+        bool: 앞면/뒷면이면 True, 측면이면 False
+    """
+    x1, y1, x2, y2 = vehicle_box[:4]
+    width = x2 - x1
+    height = y2 - y1
+
+    if height <= 0:
+        return False
+
+    aspect_ratio = width / height
+    return aspect_ratio < aspect_threshold
+
+
+def get_vehicle_lower_region(vehicle_box, frame_shape,
+                              upper_ratio=0.35,
+                              side_margin=0.05,
+                              bottom_margin=0.02):
+    """
+    차량 하단 영역 계산 (유리창 아래 = 번호판 포함 영역)
+
+    차량 bbox에서:
+    - 상단 upper_ratio (35%) 제외 = 유리창/지붕 영역
+    - 나머지 하단 영역 = 번호판, 범퍼, 그릴 포함
+
+    Args:
+        vehicle_box: (x1, y1, x2, y2) 차량 bbox
+        frame_shape: 프레임 shape (h, w, ...)
+        upper_ratio: 제외할 상단 비율 (기본 0.35 = 상단 35% 제외)
+        side_margin: 좌우 마진 비율 (기본 0.05 = 양쪽 5% 축소)
+        bottom_margin: 하단 마진 비율 (기본 0.02 = 바닥 2% 제외)
+
+    Returns:
+        (x1, y1, x2, y2): 마스킹할 하단 영역
+    """
+    x1, y1, x2, y2 = vehicle_box[:4]
+    h, w = frame_shape[:2]
+
+    box_width = x2 - x1
+    box_height = y2 - y1
+
+    # 하단 영역 계산
+    new_y1 = y1 + box_height * upper_ratio  # 상단 35% 제외
+    new_y2 = y2 - box_height * bottom_margin  # 바닥 약간 제외
+
+    # 좌우 마진 적용 (차량 측면 가장자리 제외)
+    margin_px = box_width * side_margin
+    new_x1 = x1 + margin_px
+    new_x2 = x2 - margin_px
+
+    # 경계 체크
+    new_x1 = max(0, int(new_x1))
+    new_y1 = max(0, int(new_y1))
+    new_x2 = min(w, int(new_x2))
+    new_y2 = min(h, int(new_y2))
+
+    return (new_x1, new_y1, new_x2, new_y2)
+
+
+def get_vehicle_side_regions(vehicle_box, frame_shape,
+                              upper_ratio=0.35,
+                              side_width_ratio=0.28,
+                              bottom_margin=0.02):
+    """
+    측면 차량의 양쪽 끝 영역 계산 (앞/뒤 번호판 가능 영역)
+
+    측면 차량 bbox에서:
+    - 상단 upper_ratio (35%) 제외 = 유리창/지붕 영역
+    - 좌측 side_width_ratio (28%) = 앞쪽 또는 뒤쪽 번호판 영역
+    - 우측 side_width_ratio (28%) = 앞쪽 또는 뒤쪽 번호판 영역
+
+    Args:
+        vehicle_box: (x1, y1, x2, y2) 차량 bbox
+        frame_shape: 프레임 shape (h, w, ...)
+        upper_ratio: 제외할 상단 비율 (기본 0.35)
+        side_width_ratio: 양쪽 끝 너비 비율 (기본 0.28 = 28%)
+        bottom_margin: 하단 마진 비율 (기본 0.02)
+
+    Returns:
+        [(x1, y1, x2, y2), (x1, y1, x2, y2)]: 좌측, 우측 영역
+    """
+    x1, y1, x2, y2 = vehicle_box[:4]
+    h, w = frame_shape[:2]
+
+    box_width = x2 - x1
+    box_height = y2 - y1
+
+    # 상하 영역 계산
+    new_y1 = y1 + box_height * upper_ratio
+    new_y2 = y2 - box_height * bottom_margin
+
+    # 좌측 영역 (차량 앞쪽 또는 뒤쪽)
+    left_x1 = x1
+    left_x2 = x1 + box_width * side_width_ratio
+
+    # 우측 영역 (차량 뒤쪽 또는 앞쪽)
+    right_x1 = x2 - box_width * side_width_ratio
+    right_x2 = x2
+
+    # 경계 체크
+    regions = []
+
+    left_region = (
+        max(0, int(left_x1)),
+        max(0, int(new_y1)),
+        min(w, int(left_x2)),
+        min(h, int(new_y2))
+    )
+    if left_region[2] > left_region[0] and left_region[3] > left_region[1]:
+        regions.append(left_region)
+
+    right_region = (
+        max(0, int(right_x1)),
+        max(0, int(new_y1)),
+        min(w, int(right_x2)),
+        min(h, int(new_y2))
+    )
+    if right_region[2] > right_region[0] and right_region[3] > right_region[1]:
+        regions.append(right_region)
+
+    return regions
+
+
+def get_plate_region_by_view(frame, vehicle_box, frame_shape,
+                              aspect_threshold=1.4,
+                              upper_ratio=0.35,
+                              side_width_ratio=0.28,
+                              expand_ratio=0.0):
+    """
+    차량 시점(앞/뒤/측면)에 따른 번호판 영역 반환
+
+    - 앞/뒷면 (종횡비 < 1.4): 하단 전체 영역 마스킹
+    - 측면 (종횡비 >= 1.4): 양쪽 끝 영역 마스킹
+
+    Args:
+        frame: 현재 프레임 (사용 안함, 호환성용)
+        vehicle_box: 차량 bbox
+        frame_shape: 프레임 shape
+        aspect_threshold: 앞/뒷면 판별 임계값
+        upper_ratio: 제외할 상단 비율
+        side_width_ratio: 측면 차량 양쪽 끝 너비 비율
+        expand_ratio: 영역 확장 비율
+
+    Returns:
+        [(x1, y1, x2, y2), ...]: 마스킹할 영역 리스트
+    """
+    regions = []
+
+    if is_front_or_rear_view(vehicle_box, aspect_threshold):
+        # 앞/뒷면 차량: 하단 영역 반환
+        region = get_vehicle_lower_region(
+            vehicle_box, frame_shape,
+            upper_ratio=upper_ratio
+        )
+        regions.append(region)
+    else:
+        # 측면 차량: 양쪽 끝 영역 반환
+        side_regions = get_vehicle_side_regions(
+            vehicle_box, frame_shape,
+            upper_ratio=upper_ratio,
+            side_width_ratio=side_width_ratio
+        )
+        regions.extend(side_regions)
+
+    # 확장 적용
+    if expand_ratio > 0 and regions:
+        regions = [expand_box(r, expand_ratio, frame_shape) for r in regions]
+
+    return regions
 
