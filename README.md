@@ -7,8 +7,11 @@ NVIDIA CUDA / Apple Silicon MPS GPU 가속, 멀티스레딩, 트래킹 보간 �
 
 - **사람 전체 마스킹**: YOLO12x 모델로 사람 감지 후 전신 마스킹 (얼굴만이 아닌 전체)
 - **차량 번호판 마스킹**: 차량 감지 + 번호판 영역 추정 마스킹
+- **적응형 색보정**: 장면별 자동 분석 + 시네마틱 필터 적용 (선택적)
+- **배치 처리 시스템**: 여러 영상 동시 처리 + 자동 큐 관리
 - **TensorRT 가속**: YOLO 모델을 TensorRT 엔진으로 변환하여 최대 성능 (기본 활성화)
 - **GPU 블러**: OpenCV CUDA 가우시안 블러 (CPU 대비 13배 빠름)
+- **GPU 색보정**: OpenCV CUDA 기반 색보정 가속
 - **NVDEC 하드웨어 디코딩**: GPU에서 직접 영상 디코딩
 - **NVENC 하드웨어 인코딩**: RTX GPU에서 H.264/HEVC 하드웨어 인코딩
 - **FP16 반정밀도 추론**: NVIDIA GPU에서 메모리 절약 및 속도 향상
@@ -23,12 +26,19 @@ NVIDIA CUDA / Apple Silicon MPS GPU 가속, 멀티스레딩, 트래킹 보간 �
 jeju_masking/
 ├── mask_video.py            # CLI 인터페이스 (권장 진입점)
 ├── video_masker.py          # 핵심 마스킹 클래스 (VideoMasker, VideoMaskerOptimized)
+├── adaptive_color_grade.py  # 적응형 색보정 모듈 (ColorGrader 클래스)
+├── batch_masking.py         # 배치 처리 큐 시스템
 ├── masking_utils.py         # 공용 유틸리티 (로거, 시간 파싱 등)
 ├── encoding_utils.py        # 인코딩 유틸리티 (NVENC 설정, 시스템 최적화)
 ├── two_pass.py              # 2-Pass 모드 함수
 ├── high_performance.py      # 고성능 모드 함수
 ├── models/                  # 감지 모델 (자동 다운로드)
 ├── movs/                    # 입출력 영상 폴더
+│   └── 4k_420_10bit/        # 4K 10bit 영상 폴더
+│       ├── day/             # 주간 영상
+│       │   └── masking/     # 마스킹 출력 폴더
+│       └── night/           # 야간 영상
+│           └── masking/     # 마스킹 출력 폴더
 ├── SETUP.md                 # 환경 설정 가이드
 └── README.md                # 이 파일
 ```
@@ -150,6 +160,14 @@ python mask_video.py input.mp4
 | `--blur-strength` | 블러 강도 (홀수 값, GPU는 31 이하) | `31` |
 | `--mosaic-size` | 모자이크 블록 크기 | `15` |
 
+#### 색보정 옵션 (적응형 필터)
+
+| 옵션 | 설명 | 기본값 |
+|------|------|--------|
+| `--color-grade` | 적응형 색보정 활성화 | 비활성화 |
+| `--cg-interval` | 분석 주기 (프레임 단위) | `1000` |
+| `--cg-smooth` | 부드러운 전환 윈도우 (프레임 단위) | `300` |
+
 #### 감지 파라미터
 
 | 옵션 | 설명 | 기본값 |
@@ -256,6 +274,38 @@ python mask_video.py video2.mp4 --encode-only --mask-json video2_masks.json --he
 python mask_video.py video3.mp4 --encode-only --mask-json video3_masks.json --hevc
 ```
 
+### 적응형 색보정 + 마스킹
+
+```bash
+# 마스킹 + 시네마틱 색보정 (기본 설정)
+python mask_video.py video.mp4 --color-grade --hevc
+
+# 색보정 분석 주기 조정 (500프레임마다 분석)
+python mask_video.py video.mp4 --color-grade --cg-interval 500 --hevc
+
+# 색보정 전환 부드럽게 (600프레임 윈도우)
+python mask_video.py video.mp4 --color-grade --cg-smooth 600 --hevc
+```
+
+### 배치 처리 (여러 영상 자동 큐)
+
+```bash
+# 기본 배치 처리 (2개 동시 처리)
+python batch_masking.py /path/to/video/folder
+
+# 동시 처리 개수 지정
+python batch_masking.py /path/to/video/folder --workers 3
+
+# 색보정 비활성화
+python batch_masking.py /path/to/video/folder --no-color-grade
+
+# 출력 경로 지정
+python batch_masking.py /path/to/input --output-dir /path/to/output
+
+# 작업 미리보기 (실제 실행 안 함)
+python batch_masking.py /path/to/video/folder --dry-run
+```
+
 ### 번호판/사람 선택 마스킹
 
 ```bash
@@ -298,6 +348,133 @@ tail -f masking.log
 
 ---
 
+## 적응형 색보정 (Adaptive Color Grading)
+
+### 개요
+
+적응형 색보정은 영상의 장면별 특성을 분석하여 자동으로 시네마틱 필터를 적용합니다.
+일반적인 LUT(Look-Up Table) 방식과 달리, 각 장면의 밝기와 채도를 분석하여
+최적의 보정값을 실시간으로 계산합니다.
+
+### 작동 원리
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. 분석 단계 (프레임 0, 1000, 2000, ...)                      │
+│                                                             │
+│   프레임 → [밝기 분석] → [채도 분석] → 보정 파라미터 계산     │
+│            (HSV V채널)    (HSV S채널)                         │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 2. 보간 단계 (중간 프레임)                                    │
+│                                                             │
+│   키프레임 A ─── [선형 보간] ─── 키프레임 B                   │
+│   (프레임 0)     (프레임 500)     (프레임 1000)                │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 3. 스무딩 단계 (이동평균)                                     │
+│                                                             │
+│   [보간된 값] → [이동평균 필터] → 최종 보정 파라미터          │
+│                (윈도우: 300 프레임)                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### C 스타일 필터 특성
+
+기본 적용되는 "C 스타일"은 시네마틱한 느낌을 연출합니다:
+
+| 파라미터 | 값 | 설명 |
+|----------|----|----- |
+| 목표 밝기 | 115 | 약간 밝은 톤 |
+| 목표 채도 | 130 | 생생한 색감 |
+| 대비 | 1.15 | 살짝 강조된 대비 |
+| 따뜻함 | 15 | 오렌지/골드 톤 |
+| 하이라이트 보호 | 0.8 | 과노출 방지 |
+
+### GPU 가속
+
+OpenCV CUDA가 사용 가능한 경우 GPU에서 색보정을 처리합니다:
+
+```python
+# GPU 사용 여부 자동 감지
+# cv2.cuda.getCudaEnabledDeviceCount() > 0 이면 GPU 사용
+
+# GPU 색보정 파이프라인:
+# 1. cv2.cuda_GpuMat.upload() - CPU → GPU 전송
+# 2. cv2.cuda.cvtColor() - 색공간 변환
+# 3. cv2.cuda.split/merge() - 채널 분리/병합
+# 4. cv2.cuda_GpuMat.download() - GPU → CPU 전송
+```
+
+### 파라미터 조정 가이드
+
+| 상황 | 권장 설정 |
+|------|-----------|
+| **급격한 장면 변화** | `--cg-interval 500` (더 자주 분석) |
+| **일정한 조명** | `--cg-interval 2000` (분석 빈도 감소) |
+| **부드러운 전환** | `--cg-smooth 600` (큰 윈도우) |
+| **빠른 반응** | `--cg-smooth 100` (작은 윈도우) |
+
+---
+
+## 배치 처리 시스템
+
+### 개요
+
+`batch_masking.py`는 여러 영상을 자동으로 처리하는 큐 시스템입니다.
+지정된 수의 영상을 동시에 처리하고, 하나가 완료되면 다음 파일을 자동으로 시작합니다.
+
+### 사용법
+
+```bash
+# 기본 사용 (2개 동시 처리, 색보정 활성화)
+python batch_masking.py /path/to/videos
+
+# 옵션
+python batch_masking.py /path/to/videos \
+    --output-dir /path/to/output \   # 출력 경로
+    --workers 3 \                     # 동시 처리 개수
+    --no-color-grade \                # 색보정 비활성화
+    --log-dir /path/to/logs \         # 로그 경로
+    --dry-run                         # 미리보기
+```
+
+### 로그 구조
+
+```
+masking/logs/
+├── batch_20260112_010317.log   # 마스터 로그 (전체 진행)
+├── 01-111_4k_420_10bit.log     # 개별 로그 (파일별 상세)
+├── 01-222_4k_420_10bit.log
+└── ...
+```
+
+### 마스터 로그 예시
+
+```
+[2026-01-12 01:03:17] ==================================================
+[2026-01-12 01:03:17] 배치 마스킹 작업 시작
+[2026-01-12 01:03:17] 총 파일: 10개, 동시 처리: 2개
+[2026-01-12 01:03:17] ==================================================
+[2026-01-12 01:03:17] ▶ 시작: 01-111_4k_420_10bit.mp4
+[2026-01-12 01:03:17] ▶ 시작: 01-222_4k_420_10bit.mp4
+[2026-01-12 02:15:30] ✓ 완료: 01-222_4k_420_10bit.mp4 (1시간 12분 13초)
+[2026-01-12 02:15:30]    진행: 1/10 완료, 9개 남음
+[2026-01-12 02:15:30] ▶ 시작: 01-333_4k_420_10bit.mp4
+```
+
+### 권장 동시 처리 수
+
+| 시스템 RAM | GPU VRAM | 권장 workers |
+|-----------|----------|--------------|
+| 16GB | 8GB | 1 |
+| 32GB | 12GB | **2** |
+| 64GB | 12GB+ | 3-4 |
+
+---
+
 ## 권장 파라미터 설정
 
 ### 시나리오별 권장 설정
@@ -333,6 +510,16 @@ python mask_video.py video1.mp4 --queue-size 64 --hevc -o out1.mp4 &
 python mask_video.py video2.mp4 --queue-size 64 --hevc -o out2.mp4 &
 python mask_video.py video3.mp4 --queue-size 64 --hevc -o out3.mp4 &
 wait
+```
+
+#### 🎨 마스킹 + 색보정 통합 처리
+
+```bash
+# 단일 영상: 마스킹 + 시네마틱 색보정
+python mask_video.py video.mp4 --color-grade --hevc
+
+# 배치 처리: 폴더 내 모든 영상 자동 처리
+python batch_masking.py ./videos --workers 2
 ```
 
 #### 🔬 정확도 최대 (느리지만 정밀)
@@ -630,18 +817,47 @@ done
 
 ## 변경 이력
 
-### v3.3 - 2026-01-05 (현재)
+### v3.4 - 2026-01-12 (현재)
+
+**적응형 색보정 시스템 추가**
+- **장면별 자동 분석**: 지정된 프레임 간격(기본 1000프레임)마다 밝기/채도 분석
+- **시네마틱 필터 적용**: 따뜻한 톤, 대비 향상, 채도 조절 (C 스타일)
+- **부드러운 전환**: 장면 변화 시 급격한 필터 변화 방지 (보간 + 이동평균)
+- **GPU 가속**: OpenCV CUDA 기반 색보정으로 CPU 대비 빠른 처리
+- **마스킹 통합**: 읽기 → 색보정 → 마스킹 → 인코딩 단일 패스로 효율적 처리
+
+**배치 처리 큐 시스템 (`batch_masking.py`)**
+- **동시 처리 지원**: 최대 N개 영상 병렬 처리 (기본 2개)
+- **자동 큐 관리**: 하나 완료 시 다음 파일 자동 시작
+- **상세 로그 시스템**:
+  - 마스터 로그: 전체 진행 상황 기록
+  - 개별 로그: 파일별 상세 처리 로그 (`logs/파일명.log`)
+- **색보정 통합**: `--color-grade` 옵션 기본 활성화
+- **에러 핸들링**: TensorRT 배치 호환 문제로 PyTorch 모델 사용 (`--no-tensorrt`)
+
+**파일 조직화**
+- 영상 밝기 기반 day/night 폴더 자동 분류
+- 각 폴더별 masking 출력 디렉토리 구조
+
+**새로운 CLI 옵션**
+- `--color-grade`: 적응형 색보정 활성화
+- `--cg-interval`: 분석 주기 (프레임 단위, 기본 1000)
+- `--cg-smooth`: 부드러운 전환 윈도우 (프레임 단위, 기본 300)
+
+**신규 파일**
+- `adaptive_color_grade.py`: 적응형 색보정 모듈
+  - `ColorGrader` 클래스: 마스킹 파이프라인 통합용
+  - `TargetStyle`: 목표 스타일 파라미터 (C 스타일 기본)
+  - `CorrectionParams`: 프레임별 보정 파라미터
+  - GPU/CPU 자동 선택 (`apply_correction_gpu`, `apply_correction`)
+- `batch_masking.py`: 배치 처리 큐 시스템
+
+### v3.3 - 2026-01-05
 
 **문서 개선**
-- **TensorRT 엔진 제작 가이드 강화**:
-  - YOLO CLI 및 trtexec 사용법 상세 설명
-  - 배치 크기별 엔진 파일 관리 방법
-  - 동적 배치 vs 고정 배치 엔진 비교
-- **권장 파라미터 설정 섹션 추가**:
-  - 시나리오별 권장 설정 (품질/속도/병렬/정확도/저사양)
-  - 기본 파라미터 값 요약 표
-  - 자동 최적화(-1) 계산 기준 설명
-- **빠른 시작 가이드 추가**: TensorRT 엔진 사전 생성 안내
+- TensorRT 엔진 제작 가이드 강화 (YOLO CLI, trtexec)
+- 권장 파라미터 설정 섹션 추가
+- 빠른 시작 가이드 추가
 
 ### v3.2 - 2026-01-04
 
