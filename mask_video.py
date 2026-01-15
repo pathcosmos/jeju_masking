@@ -165,14 +165,6 @@ def main():
     parser.add_argument("--preview", action="store_true", help="미리보기")
     parser.add_argument("--max-frames", type=int, help="최대 프레임 수 (테스트용)")
 
-    # 적응형 색보정 옵션
-    parser.add_argument("--color-grade", action="store_true",
-                       help="적응형 색보정 활성화 (C 스타일 따뜻한 시네마틱)")
-    parser.add_argument("--cg-interval", type=int, default=1000,
-                       help="색보정 분석 간격 (프레임, 기본값: 1000)")
-    parser.add_argument("--cg-smooth", type=int, default=300,
-                       help="색보정 스무딩 윈도우 (프레임, 기본값: 300)")
-
     # 로깅
     parser.add_argument("--log", type=str, help="로그 파일 경로")
     parser.add_argument("--verbose", "-v", action="store_true", help="상세 로그")
@@ -240,9 +232,6 @@ def main():
             tracker=args.tracker,
             track_buffer=args.track_buffer,
             use_nvdec=args.nvdec,
-            color_grade=args.color_grade,
-            color_grade_interval=args.cg_interval,
-            color_grade_smooth=args.cg_smooth,
         )
 
         # 2-Pass 모드 분기

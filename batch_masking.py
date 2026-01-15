@@ -55,9 +55,8 @@ def write_log(log_file: str, message: str, also_print: bool = True):
 
 
 def process_video(input_file: Path, output_dir: Path, log_dir: Path,
-                  master_log: str, color_grade: bool = True,
-                  extra_args: list = None) -> dict:
-    """단일 비디오 처리"""
+                  master_log: str, extra_args: list = None) -> dict:
+    """단일 비디오 처리 (마스킹만)"""
     start_time = time.time()
 
     # 출력 파일명
@@ -85,9 +84,6 @@ def process_video(input_file: Path, output_dir: Path, log_dir: Path,
         "--queue-size", "256",
         "--no-tensorrt",  # PyTorch 모델 사용 (TensorRT 배치 호환 문제 회피)
     ]
-
-    if color_grade:
-        cmd.extend(["--color-grade", "--cg-interval", "1000", "--cg-smooth", "300"])
 
     if extra_args:
         cmd.extend(extra_args)
@@ -154,8 +150,6 @@ def main():
     parser.add_argument('-o', '--output-dir', help='출력 디렉토리 (기본: input_dir/masking)')
     parser.add_argument('-w', '--workers', type=int, default=2,
                        help='동시 처리 개수 (기본: 2)')
-    parser.add_argument('--no-color-grade', action='store_true',
-                       help='색보정 비활성화')
     parser.add_argument('--log-dir', help='로그 디렉토리')
     parser.add_argument('--dry-run', action='store_true',
                        help='실제 실행 없이 작업 목록만 출력')
@@ -190,7 +184,6 @@ def main():
     print(f"출력 디렉토리: {output_dir}")
     print(f"로그 디렉토리: {log_dir}")
     print(f"동시 처리: {args.workers}개")
-    print(f"색보정: {'비활성화' if args.no_color_grade else '활성화'}")
     print(f"마스터 로그: {master_log}")
     print("-" * 60)
     print(f"작업 대상: {len(video_files)}개 파일")
@@ -221,8 +214,7 @@ def main():
                 video_file,
                 output_dir,
                 log_dir,
-                master_log,
-                not args.no_color_grade
+                master_log
             ): video_file for video_file in video_files
         }
 

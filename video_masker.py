@@ -32,7 +32,6 @@ from encoding_utils import (
 )
 from high_performance import process_video_high_performance
 from two_pass import analyze_video, encode_with_masks, process_video_2pass
-from adaptive_color_grade import ColorGrader
 
 
 # ============================================================
@@ -1031,10 +1030,6 @@ class VideoMaskerOptimized(VideoMasker):
         iou_thresh: float = 0.5,
         # 하드웨어 가속 디코딩
         use_nvdec: bool = True,  # NVDEC GPU 디코딩 (NVIDIA GPU 필수)
-        # 적응형 색보정 옵션
-        color_grade: bool = False,  # 적응형 색보정 적용 여부
-        color_grade_interval: int = 1000,  # 색보정 분석 간격 (프레임)
-        color_grade_smooth: int = 300,  # 색보정 스무딩 윈도우 (프레임)
     ):
         # 부모 클래스의 기본 속성만 설정 (모델 로드 제외)
         self.mask_persons = mask_persons
@@ -1145,30 +1140,6 @@ class VideoMaskerOptimized(VideoMasker):
         
         # 번호판 트래커 (깜빡임 방지)
         self.plate_tracker = PlateTracker(max_age=track_buffer * 2, smoothing=self.plate_smoothing)
-
-        # 적응형 색보정 설정
-        self.color_grade = color_grade
-        self.color_grade_interval = color_grade_interval
-        self.color_grade_smooth = color_grade_smooth
-        self.color_grader = None  # 비디오 처리 시 초기화
-
-    def init_color_grader(self, video_path: str):
-        """적응형 색보정 초기화 (비디오 처리 전 호출)"""
-        if self.color_grade:
-            print(f"[ColorGrade] 적응형 색보정 활성화")
-            print(f"   분석 간격: {self.color_grade_interval} 프레임, 스무딩: {self.color_grade_smooth} 프레임")
-            self.color_grader = ColorGrader(
-                video_path,
-                analyze_interval=self.color_grade_interval,
-                smooth_window=self.color_grade_smooth,
-                verbose=True
-            )
-
-    def apply_color_grade(self, frame: np.ndarray, frame_idx: int) -> np.ndarray:
-        """프레임에 적응형 색보정 적용"""
-        if self.color_grader is not None:
-            return self.color_grader.apply(frame, frame_idx)
-        return frame
 
     def detect_all(self, frame, frame_idx):
         """사람과 차량 모두 감지"""
@@ -1385,9 +1356,6 @@ class VideoMaskerOptimized(VideoMasker):
 
     def process_frame_optimized(self, frame, frame_idx, force_detect=False):
         """단일 프레임 처리 (보간 + 번호판 트래킹 포함)"""
-        # 적응형 색보정 적용 (마스킹 전)
-        frame = self.apply_color_grade(frame, frame_idx)
-
         should_detect = force_detect or (frame_idx % self.detect_interval == 0)
 
         if should_detect:
@@ -1509,13 +1477,8 @@ class VideoMaskerOptimized(VideoMasker):
             'use_temporal_aq': True,
         }
 
-        # 적응형 색보정 초기화
-        self.init_color_grader(input_path)
-
         logger.info(f"고성능 모드 (멀티스레딩 파이프라인 + 배치 GPU 추론)")
         logger.info(f"   [추론] 배치: {self.batch_size}, 감지간격: {self.detect_interval}, FP16: {self.use_fp16}")
-        if self.color_grade:
-            logger.info(f"   [색보정] 적응형 색보정 활성화 (간격: {self.color_grade_interval}, 스무딩: {self.color_grade_smooth})")
         logger.info(f"   [인코딩] NVENC {encode_settings.get('nvenc_preset', 'p4')}, "
                    f"Lookahead: {encode_settings.get('nvenc_lookahead', 32)}, "
                    f"Surfaces: {encode_settings.get('nvenc_surfaces', 16)}")
